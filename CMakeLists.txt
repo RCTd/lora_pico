@@ -8,6 +8,7 @@ add_executable(lora_dma
 target_link_libraries(lora_dma
         pico_stdlib
         hardware_pio
+        hardware_dma
         pico_multicore)
 
 pico_enable_stdio_usb(lora_dma 1)
