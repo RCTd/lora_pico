@@ -13,60 +13,58 @@
 // Signal Parameters
 const double f_start  = 863770000.0; 
 const double f_end    = 863780000.0; 
-const double f_sample = 25000000.0; // Lower bit rate to 25 MHz to give CPU time
+const double f_sample = 10000000.0;  // 10 MHz Bitrate (100ns per bit)
 
 // Timing Parameters
-#define SAMPLES_PER_SEC 25000000
-#define ON_SAMPLES  (3ULL * SAMPLES_PER_SEC)
-#define OFF_MS      3000
-#define ON_BUFFERS  ((3 * SAMPLES_PER_SEC) / (BUFFER_SIZE * 32))
+#define SAMPLES_PER_SEC 10000000ULL
+#define ON_SAMPLES      (3ULL * SAMPLES_PER_SEC)
+#define OFF_MS          3000
+
+// Buffers per 3s burst: (3 * 10,000,000) / (1024 * 32) = ~915.5
+#define ON_BUFFERS 916
+
+// Phase increments pre-calculated for each buffer to save CPU
+uint32_t buffer_phase_incs[ON_BUFFERS];
 
 // High-speed DDS state
 uint32_t phase_acc = 0;
-float sine_table[256];
+uint8_t bit_lookup[256];
 
-void init_sine_table() {
+void init_tables() {
+    // 1. Bit Lookup Table
     for (int i = 0; i < 256; i++) {
-        sine_table[i] = sinf(2.0f * M_PI * i / 256.0f);
+        float val = sinf(2.0f * M_PI * i / 256.0f);
+        bit_lookup[i] = (val > 0.1f) ? 1 : 0;
+    }
+
+    // 2. Pre-calculate frequency ramp for every buffer
+    for (int b = 0; b < ON_BUFFERS; b++) {
+        double progress = (double)b / (double)ON_BUFFERS;
+        double current_f = progress * (f_end - f_start) + f_start;
+        double ratio = current_f / f_sample;
+        buffer_phase_incs[b] = (uint32_t)((ratio - floor(ratio)) * 4294967296.0);
     }
 }
 
-uint64_t global_sample_count = 0;
 uint32_t buffer_0[BUFFER_SIZE];
 uint32_t buffer_1[BUFFER_SIZE];
 
-// Optimized real-time bit generation
-void fill_signal_buffer_dds(uint32_t *buffer) {
+// ULTRALIGHT bit loop
+static inline void fill_buffer_ultrafast(uint32_t *buffer, uint32_t phase_inc) {
     for (size_t i = 0; i < BUFFER_SIZE; ++i) {
         uint32_t sample_word = 0;
-        
-        // Linear frequency interpolation
-        double progress = (double)global_sample_count / (double)ON_SAMPLES;
-        if (progress > 1.0) progress = 1.0;
-        double current_f = progress * (f_end - f_start) + f_start;
-        
-        // Calculate phase increment (fractional part of f/fs * 2^32)
-        double ratio = current_f / f_sample;
-        double fractional_ratio = ratio - floor(ratio);
-        uint32_t phase_inc = (uint32_t)(fractional_ratio * (double)(1ULL << 32));
-
-        for (int bit_idx = 0; bit_idx < 32; ++bit_idx) {
-            // DDS Lookup
-            float val = sine_table[phase_acc >> 24];
-            int bit = (val > 0.1f) ? 1 : 0;
-
-            sample_word = (sample_word << 1) | (uint32_t)bit;
-            
+        // 32 bits per word
+        for (int b = 0; b < 32; b++) {
+            sample_word = (sample_word << 1) | bit_lookup[phase_acc >> 24];
             phase_acc += phase_inc;
-            global_sample_count++;
         }
         buffer[i] = sample_word;
     }
 }
 
 void core1_entry() {
-    printf("Core 1: Starting 25 MHz DDS Chirp (Optimized)\n");
-    init_sine_table();
+    printf("Core 1: 10 MHz Bitrate Chirp (Optimized Loop)\n");
+    init_tables();
 
     PIO pio = pio0;
     uint offset = pio_add_program(pio, &lora_out_program);
@@ -77,12 +75,8 @@ void core1_entry() {
     pio_sm_config c = lora_out_program_get_default_config(offset);
     sm_config_set_out_pins(&c, OUTPUT_PIN, 1);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
-    
-    // Shift Left (MSB first)
     sm_config_set_out_shift(&c, false, true, 32); 
-    
-    // Set PIO clock to 25 MHz (125 / 5 = 25)
-    sm_config_set_clkdiv(&c, 5.0f);
+    sm_config_set_clkdiv(&c, 12.5f); // 125 / 12.5 = 10 MHz
 
     pio_sm_init(pio, sm, offset, &c);
 
@@ -103,40 +97,47 @@ void core1_entry() {
     channel_config_set_chain_to(&c1, chan0);
 
     while (1) {
-        printf("ON\n");
-        global_sample_count = 0;
+        printf("Chirp Start (863 to 873 MHz)\n");
         phase_acc = 0;
         pio_sm_set_enabled(pio, sm, true);
         
-        fill_signal_buffer_dds(buffer_0);
-        fill_signal_buffer_dds(buffer_1);
+        // Initial 2 buffers
+        fill_buffer_ultrafast(buffer_0, buffer_phase_incs[0]);
+        fill_buffer_ultrafast(buffer_1, buffer_phase_incs[1]);
 
         dma_channel_configure(chan0, &c0, &pio->txf[sm], buffer_0, BUFFER_SIZE, true);
         dma_channel_configure(chan1, &c1, &pio->txf[sm], buffer_1, BUFFER_SIZE, false);
 
-        for (uint32_t i = 0; i < ON_BUFFERS; i += 2) {
+        // Run the 3-second burst
+        for (int b = 2; b < ON_BUFFERS; b += 2) {
             dma_channel_wait_for_finish_blocking(chan0);
-            fill_signal_buffer_dds(buffer_0);
+            fill_buffer_ultrafast(buffer_0, buffer_phase_incs[b]);
             dma_channel_set_read_addr(chan0, buffer_0, false);
             
             dma_channel_wait_for_finish_blocking(chan1);
-            fill_signal_buffer_dds(buffer_1);
-            dma_channel_set_read_addr(chan1, buffer_1, false);
+            if (b + 1 < ON_BUFFERS) {
+                fill_buffer_ultrafast(buffer_1, buffer_phase_incs[b+1]);
+                dma_channel_set_read_addr(chan1, buffer_1, false);
+            }
         }
+
+        // Wait for the final buffers to finish outputting
+        dma_channel_wait_for_finish_blocking(chan0);
+        dma_channel_wait_for_finish_blocking(chan1);
 
         dma_channel_abort(chan0);
         dma_channel_abort(chan1);
         pio_sm_set_enabled(pio, sm, false);
         gpio_put(OUTPUT_PIN, 0);
 
-        printf("OFF\n");
+        printf("Silence (3s)\n");
         sleep_ms(OFF_MS);
     }
 }
 
 int main() {
     stdio_init_all();
-    printf("Pico W: 25 MHz DDS Chirp implementation\n");
+    printf("Pico W: Zero-Jitter Chirp Implementation\n");
     multicore_launch_core1(core1_entry);
     while (1) tight_loop_contents();
 }
