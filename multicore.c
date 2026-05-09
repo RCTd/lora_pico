@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/pio.h"
@@ -9,59 +10,71 @@
 #define OUTPUT_PIN 1
 #define BUFFER_SIZE 1024
 
-// Equation parameters
-const double target_freq = 868000000.0; // 868 MHz
-const double bit_rate = 125000000.0;    // 125 Mbps
-const float threshold = 0.1f;
+// 24 / 125 repeats every 125 bits. 
+// LCM(125, 32) = 4000 bits = 125 words.
+#define PATTERN_WORDS 125
+uint32_t pattern_24mhz[PATTERN_WORDS];
 
-// Phase accumulator for DDS (Direct Digital Synthesis)
-uint32_t phase_acc = 0;
-uint32_t phase_inc;
-
-// Sine lookup table for performance
-float sine_table[256];
-
-void init_sine_table() {
-    for (int i = 0; i < 256; i++) {
-        sine_table[i] = sinf(2.0f * M_PI * i / 256.0f);
-    }
-    // Calculate phase increment per bit
-    // phase_inc = (f / bit_rate) * 2^32
-    phase_inc = (uint32_t)((target_freq / bit_rate) * (double)(1ULL << 32));
-}
+// Timing Parameters
+// 125,000,000 bits/sec / (1024 * 32) bits/buffer = ~3814.7 buffers/sec
+#define BUFFERS_PER_SEC 3815
+#define ON_BUFFERS (BUFFERS_PER_SEC * 2)
+#define OFF_BUFFERS (BUFFERS_PER_SEC * 1)
 
 uint32_t buffer_0[BUFFER_SIZE];
 uint32_t buffer_1[BUFFER_SIZE];
 
-void fill_buffer_from_equation(uint32_t *buffer) {
-    for (size_t i = 0; i < BUFFER_SIZE; ++i) {
-        uint32_t word = 0;
-        for (int bit = 0; bit < 32; ++bit) {
-            // Get value from lookup table using top 8 bits of accumulator
-            float val = sine_table[phase_acc >> 24];
-            if (val > threshold) {
-                word |= (1u << bit);
-            }
-            phase_acc += phase_inc;
+void precalculate_24mhz() {
+    double f_target = 24000000.0;
+    double f_sample = 125000000.0;
+    float threshold = 0.1f;
+
+    for (int i = 0; i < PATTERN_WORDS; i++) pattern_24mhz[i] = 0;
+
+    for (int n = 0; n < PATTERN_WORDS * 32; n++) {
+        double val = sin(2.0 * M_PI * f_target * ((double)n / f_sample));
+        if (val > threshold) {
+            // MSB-first packing to match PIO shift direction
+            int word_idx = n / 32;
+            int bit_in_word = 31 - (n % 32); 
+            pattern_24mhz[word_idx] |= (1u << bit_in_word);
         }
-        buffer[i] = word;
+    }
+}
+
+void fast_fill_buffer(uint32_t *buffer, bool enabled) {
+    if (!enabled) {
+        memset(buffer, 0, BUFFER_SIZE * sizeof(uint32_t));
+        return;
+    }
+    
+    // Efficiently fill the buffer with the repeating 24MHz pattern
+    for (int i = 0; i < BUFFER_SIZE; i += PATTERN_WORDS) {
+        int to_copy = (i + PATTERN_WORDS <= BUFFER_SIZE) ? PATTERN_WORDS : (BUFFER_SIZE - i);
+        memcpy(buffer + i, pattern_24mhz, to_copy * sizeof(uint32_t));
     }
 }
 
 void core1_entry() {
-    printf("Core 1: Sine Equation Output Started\n");
-    printf("Target Freq: %.1f Hz, Bit Rate: %.1f Hz\n", target_freq, bit_rate);
-    
-    if (target_freq >= bit_rate / 2.0) {
-        printf("Warning: Frequency is above Nyquist (%.1f Hz). Aliasing will occur.\n", bit_rate / 2.0);
-    }
-
-    init_sine_table();
+    printf("Core 1: Starting pulsed 24 MHz output (2s ON, 1s OFF)\n");
+    precalculate_24mhz();
 
     PIO pio = pio0;
     uint offset = pio_add_program(pio, &lora_out_program);
     uint sm = pio_claim_unused_sm(pio, true);
-    lora_out_program_init(pio, sm, offset, OUTPUT_PIN, 1.0f);
+    
+    pio_gpio_init(pio, OUTPUT_PIN);
+    pio_sm_set_consecutive_pindirs(pio, sm, OUTPUT_PIN, 1, true);
+    pio_sm_config c = lora_out_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, OUTPUT_PIN, 1);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    
+    // MSB-first shifting
+    sm_config_set_out_shift(&c, false, true, 32); 
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
 
     int chan0 = dma_claim_unused_channel(true);
     int chan1 = dma_claim_unused_channel(true);
@@ -80,9 +93,11 @@ void core1_entry() {
     channel_config_set_dreq(&c1, pio_get_dreq(pio, sm, true));
     channel_config_set_chain_to(&c1, chan0);
 
-    // Initial fill
-    fill_buffer_from_equation(buffer_0);
-    fill_buffer_from_equation(buffer_1);
+    bool is_on = true;
+    uint32_t buffer_counter = 0;
+
+    fast_fill_buffer(buffer_0, is_on);
+    fast_fill_buffer(buffer_1, is_on);
 
     dma_channel_configure(chan0, &c0, &pio->txf[sm], buffer_0, BUFFER_SIZE, false);
     dma_channel_configure(chan1, &c1, &pio->txf[sm], buffer_1, BUFFER_SIZE, false);
@@ -91,18 +106,38 @@ void core1_entry() {
 
     while (1) {
         dma_channel_wait_for_finish_blocking(chan0);
-        fill_buffer_from_equation(buffer_0);
+        buffer_counter++;
+        if (is_on && buffer_counter >= ON_BUFFERS) {
+            is_on = false;
+            buffer_counter = 0;
+            printf("Switching to OFF\n");
+        } else if (!is_on && buffer_counter >= OFF_BUFFERS) {
+            is_on = true;
+            buffer_counter = 0;
+            printf("Switching to ON\n");
+        }
+        fast_fill_buffer(buffer_0, is_on);
         dma_channel_set_read_addr(chan0, buffer_0, false);
 
         dma_channel_wait_for_finish_blocking(chan1);
-        fill_buffer_from_equation(buffer_1);
+        buffer_counter++;
+        if (is_on && buffer_counter >= ON_BUFFERS) {
+            is_on = false;
+            buffer_counter = 0;
+            printf("Switching to OFF\n");
+        } else if (!is_on && buffer_counter >= OFF_BUFFERS) {
+            is_on = true;
+            buffer_counter = 0;
+            printf("Switching to ON\n");
+        }
+        fast_fill_buffer(buffer_1, is_on);
         dma_channel_set_read_addr(chan1, buffer_1, false);
     }
 }
 
 int main() {
     stdio_init_all();
-    printf("Pico W: Sine Equation (125 MHz Sampling)\n");
+    printf("Pico W: Reverted Pulsed 24 MHz Output\n");
 
     multicore_launch_core1(core1_entry);
 
