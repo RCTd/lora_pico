@@ -1,0 +1,18 @@
+identifier: ttgo_t_beam/esp32/procpu
+name: TTGO T-Beam PROCPU
+type: mcu
+arch: xtensa
+toolchain:
+  - zephyr
+supported:
+  - gpio
+  - i2c
+  - spi
+  - watchdog
+  - uart
+  - pinmux
+  - display
+  - lora
+  - nvs
+  - sdhc
+vendor: lilygo
