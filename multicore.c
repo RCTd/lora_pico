@@ -11,22 +11,25 @@
 #include "pico/binary_info.h"
 
 #define OUTPUT_PIN 1
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 64  // Smaller buffers for higher resolution (128 symbols * 64 words * 32 bits = 262144 samples)
 
 bi_decl(bi_program_description("Hardware-Accelerated Lora Chirp Generator"));
 bi_decl(bi_1pin_with_name(OUTPUT_PIN, "RF Output"));
 
-// LoRa Parameters (Centering exactly at 865.1 MHz, 125kHz BW)
+// LoRa SF7/125kHz Parameters
+// T_symbol = 2^SF / BW = 128 / 125000 = 1.024ms
+// However, to keep it slow enough to see but technically structured:
+// Let's target ~10ms (approx 10x slower than real time)
 const double f_center = 865100000.0;
 const double bandwidth = 125000.0;
 const double f_low    = f_center - bandwidth/2.0;
 const double f_high   = f_center + bandwidth/2.0;
 const double f_sample = 25000000.0;  // 25 MHz
 
-// Timing Parameters
-#define SAMPLES_PER_SEC 25000000ULL
-#define ON_SAMPLES      (12500000ULL) // 500ms at 25MHz
-#define ON_BUFFERS 381
+// Timing Parameters: 128 buffers for 128 possible shifts
+#define ON_BUFFERS 128
+#define TOTAL_SAMPLES (ON_BUFFERS * BUFFER_SIZE * 32) // 128 * 64 * 32 = 262,144 bits
+// Duration = 262144 / 25,000,000 = 10.48576 ms
 
 // Buffers are pre-calculated for "Symbol 0" (base up-chirp)
 uint32_t base_up_phase_incs[ON_BUFFERS];
@@ -35,13 +38,11 @@ uint32_t base_down_phase_incs[ON_BUFFERS];
 uint8_t bit_lookup[256];
 
 void init_tables() {
-    printf("Initializing lookup tables (50%% Duty Cycle)...\n");
+    printf("Initializing 128-buffer resolution tables...\n");
     for (int i = 0; i < 256; i++) {
         float val = sinf(2.0f * M_PI * i / 256.0f);
-        // Use 0.0f for perfect 50% duty cycle to eliminate even harmonics
         bit_lookup[i] = (val > 0.0f) ? 1 : 0;
     }
-
 
     for (int b = 0; b < ON_BUFFERS; b++) {
         double progress = (double)b / (double)ON_BUFFERS;
@@ -56,23 +57,16 @@ void init_tables() {
         double ratio_down = f_down / f_sample;
         base_down_phase_incs[b] = (uint32_t)((ratio_down - floor(ratio_down)) * 4294967296.0);
     }
-    printf("Tables ready.\n");
 }
 
 uint32_t buffer_0[BUFFER_SIZE];
 uint32_t buffer_1[BUFFER_SIZE];
 
-// Hardware-Accelerated: Uses RP2040 Interpolator for phase accumulation
+// Hardware-Accelerated DDS
 static inline void fill_buffer_optimized(uint32_t *buffer, uint32_t phase_inc, int32_t phase_inc_step) {
-    uint32_t current_phase_inc = phase_inc;
-
     for (size_t i = 0; i < BUFFER_SIZE; ++i) {
         uint32_t sample_word = 0;
-        
-        // Update hardware frequency for this word
-        interp0->base[0] = current_phase_inc;
-
-        // Process 32 bits, hardware handles the add and shift
+        interp0->base[0] = phase_inc; 
         for (int b = 0; b < 8; b++) {
             sample_word = (sample_word << 1) | bit_lookup[interp0->pop[0] >> 24];
             sample_word = (sample_word << 1) | bit_lookup[interp0->pop[0] >> 24];
@@ -80,9 +74,7 @@ static inline void fill_buffer_optimized(uint32_t *buffer, uint32_t phase_inc, i
             sample_word = (sample_word << 1) | bit_lookup[interp0->pop[0] >> 24];
         }
         buffer[i] = sample_word;
-
-        // Smoothly interpolate frequency for the next word
-        current_phase_inc += phase_inc_step;
+        phase_inc += phase_inc_step;
     }
 }
 
@@ -93,12 +85,8 @@ void run_sweep_optimized(int chan0, int chan1, uint32_t *phase_incs, int start_i
         int b_next = (start_index + i + 1) % ON_BUFFERS;
         int b_after = (start_index + i + 2) % ON_BUFFERS;
 
-        // Calculate steps for frequency interpolation
-        int32_t diff = (int32_t)(phase_incs[b_next] - phase_incs[b]);
-        int32_t s = diff / (int32_t)BUFFER_SIZE;
-
-        int32_t diff_next = (int32_t)(phase_incs[b_after] - phase_incs[b_next]);
-        int32_t s_next = diff_next / (int32_t)BUFFER_SIZE;
+        int32_t s = (int32_t)(phase_incs[b_next] - phase_incs[b]) / BUFFER_SIZE;
+        int32_t s_next = (int32_t)(phase_incs[b_after] - phase_incs[b_next]) / BUFFER_SIZE;
 
         dma_channel_wait_for_finish_blocking(chan0);
         fill_buffer_optimized(buffer_0, phase_incs[b], s);
@@ -111,21 +99,17 @@ void run_sweep_optimized(int chan0, int chan1, uint32_t *phase_incs, int start_i
 }
 
 void play_symbol(int chan0, int chan1, uint32_t *base_incs, uint16_t symbol_shift, int sf, PIO pio, uint sm) {
-    int wrap_point = (int)((double)symbol_shift / (double)(1 << sf) * ON_BUFFERS);
-    if (wrap_point % 2 != 0) wrap_point++; // Keep even for double-buffering
+    int wrap_point = symbol_shift % ON_BUFFERS;
+    if (wrap_point % 2 != 0) wrap_point++; 
 
     int remaining = ON_BUFFERS - wrap_point;
-    if (remaining > 0) {
-        run_sweep_optimized(chan0, chan1, base_incs, wrap_point, remaining);
-    }
-    if (wrap_point > 0) {
-        run_sweep_optimized(chan0, chan1, base_incs, 0, wrap_point);
-    }
+    if (remaining > 0) run_sweep_optimized(chan0, chan1, base_incs, wrap_point, remaining);
+    if (wrap_point > 0) run_sweep_optimized(chan0, chan1, base_incs, 0, wrap_point);
     printf("."); fflush(stdout);
 }
 
 void core1_entry() {
-    printf("Core 1: LoRa-Mimic Started (865.1 MHz Center)\n");
+    printf("Core 1: High-Res LoRa Started (10.48ms Symbols)\n");
     init_tables();
 
     PIO pio = pio0;
@@ -185,8 +169,8 @@ void core1_entry() {
             play_symbol(chan0, chan1, base_up_phase_incs, 0, 7, pio, sm);
         }
 
-        // 2. Sync Word - SHIFT TEST: Change 0x12 to 0x40
-        play_symbol(chan0, chan1, base_up_phase_incs, 0x40, 7, pio, sm);
+        // 2. Sync Word
+        play_symbol(chan0, chan1, base_up_phase_incs, 0x12, 7, pio, sm);
         play_symbol(chan0, chan1, base_up_phase_incs, 0x34, 7, pio, sm);
 
         // 3. SFD
