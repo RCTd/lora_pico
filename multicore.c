@@ -11,8 +11,8 @@
 #define BUFFER_SIZE 1024
 
 // Signal Parameters
-const double f_low   = 863770000.0; 
-const double f_high  = 863780000.0; // 10 kHz sweep
+const double f_low   = 865030000.0; 
+const double f_high  = 865170000.0; // 140 kHz sweep
 const double f_sample = 10000000.0;  // 10 MHz Bitrate (100ns per bit)
 
 // Timing Parameters
@@ -68,7 +68,7 @@ static inline void fill_buffer_ultrafast(uint32_t *buffer, uint32_t phase_inc) {
 }
 
 void core1_entry() {
-    printf("Core 1: Bidirectional Continuous 10 MHz Bitrate Chirp Started\n");
+    printf("Core 1: Robust Chirp Sequence Started\n");
     init_tables();
 
     PIO pio = pio0;
@@ -77,65 +77,109 @@ void core1_entry() {
     
     pio_gpio_init(pio, OUTPUT_PIN);
     pio_sm_set_consecutive_pindirs(pio, sm, OUTPUT_PIN, 1, true);
-    pio_sm_config c = lora_out_program_get_default_config(offset);
-    sm_config_set_out_pins(&c, OUTPUT_PIN, 1);
-    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
-    sm_config_set_out_shift(&c, false, true, 32); 
-    sm_config_set_clkdiv(&c, 12.5f); // 125 / 12.5 = 10 MHz
-
-    pio_sm_init(pio, sm, offset, &c);
-
+    
     int chan0 = dma_claim_unused_channel(true);
     int chan1 = dma_claim_unused_channel(true);
-    dma_channel_config c0 = dma_channel_get_default_config(chan0);
-    channel_config_set_transfer_data_size(&c0, DMA_SIZE_32);
-    channel_config_set_read_increment(&c0, true);
-    channel_config_set_write_increment(&c0, false);
-    channel_config_set_dreq(&c0, pio_get_dreq(pio, sm, true));
-    channel_config_set_chain_to(&c0, chan1);
-
-    dma_channel_config c1 = dma_channel_get_default_config(chan1);
-    channel_config_set_transfer_data_size(&c1, DMA_SIZE_32);
-    channel_config_set_read_increment(&c1, true);
-    channel_config_set_write_increment(&c1, false);
-    channel_config_set_dreq(&c1, pio_get_dreq(pio, sm, true));
-    channel_config_set_chain_to(&c1, chan0);
-
-    // Initial calculation and start
-    pio_sm_set_enabled(pio, sm, true);
-    fill_buffer_ultrafast(buffer_0, phase_incs_up[0]);
-    fill_buffer_ultrafast(buffer_1, phase_incs_up[1]);
-    dma_channel_configure(chan0, &c0, &pio->txf[sm], buffer_0, BUFFER_SIZE, true);
-    dma_channel_configure(chan1, &c1, &pio->txf[sm], buffer_1, BUFFER_SIZE, false);
 
     while (1) {
-        // --- 1. SWEEP UP (3 seconds) ---
-        printf("UP\n");
-        for (int b = 2; b < ON_BUFFERS; b += 2) {
+        // 1. Reset PIO SM Hard
+        pio_sm_set_enabled(pio, sm, false);
+        pio_sm_restart(pio, sm);
+        pio_sm_clkdiv_restart(pio, sm);
+        
+        pio_sm_config sm_c = lora_out_program_get_default_config(offset);
+        sm_config_set_out_pins(&sm_c, OUTPUT_PIN, 1);
+        sm_config_set_fifo_join(&sm_c, PIO_FIFO_JOIN_TX);
+        sm_config_set_out_shift(&sm_c, true, true, 32); 
+        sm_config_set_clkdiv(&sm_c, 12.5f); 
+        pio_sm_init(pio, sm, offset, &sm_c);
+        pio_sm_clear_fifos(pio, sm);
+
+        // 2. Fresh DMA configuration
+        dma_channel_config c0 = dma_channel_get_default_config(chan0);
+        channel_config_set_transfer_data_size(&c0, DMA_SIZE_32);
+        channel_config_set_read_increment(&c0, true);
+        channel_config_set_write_increment(&c0, false);
+        channel_config_set_dreq(&c0, pio_get_dreq(pio, sm, true));
+        channel_config_set_chain_to(&c0, chan1);
+
+        dma_channel_config c1 = dma_channel_get_default_config(chan1);
+        channel_config_set_transfer_data_size(&c1, DMA_SIZE_32);
+        channel_config_set_read_increment(&c1, true);
+        channel_config_set_write_increment(&c1, false);
+        channel_config_set_dreq(&c1, pio_get_dreq(pio, sm, true));
+        channel_config_set_chain_to(&c1, chan0);
+
+        // 3. Reset state and fill initial buffers
+        phase_acc = 0;
+        fill_buffer_ultrafast(buffer_0, phase_incs_up[0]);
+        fill_buffer_ultrafast(buffer_1, phase_incs_up[1]);
+
+        // 4. Start Sequence
+        printf("Starting Sequence...\n");
+        pio_sm_set_enabled(pio, sm, true);
+        dma_channel_configure(chan1, &c1, &pio->txf[sm], buffer_1, BUFFER_SIZE, false);
+        dma_channel_configure(chan0, &c0, &pio->txf[sm], buffer_0, BUFFER_SIZE, true); // Trigger chan0
+
+        // --- 4a. 3x UP Chirps ---
+        printf("3x UP: ");
+        for(int n=0; n<3; n++) {
+            for (int i = 0; i < ON_BUFFERS; i += 2) {
+                if (i % 200 == 0) { printf("."); fflush(stdout); }
+                dma_channel_wait_for_finish_blocking(chan0);
+                fill_buffer_ultrafast(buffer_0, phase_incs_up[i]);
+                dma_channel_set_read_addr(chan0, buffer_0, false);
+                dma_channel_wait_for_finish_blocking(chan1);
+                fill_buffer_ultrafast(buffer_1, phase_incs_up[i+1]);
+                dma_channel_set_read_addr(chan1, buffer_1, false);
+            }
+        }
+        printf(" Done\n");
+
+        // --- 4b. 1.25x DOWN Chirps ---
+        printf("1.25x DOWN: ");
+        for (int i = 0; i < ON_BUFFERS; i += 2) {
+            dma_channel_wait_for_finish_blocking(chan0);
+            fill_buffer_ultrafast(buffer_0, phase_incs_down[i]);
+            dma_channel_set_read_addr(chan0, buffer_0, false);
+            dma_channel_wait_for_finish_blocking(chan1);
+            fill_buffer_ultrafast(buffer_1, phase_incs_down[i+1]);
+            dma_channel_set_read_addr(chan1, buffer_1, false);
+        }
+        for (int i = 0; i < (ON_BUFFERS / 4); i += 2) {
+            dma_channel_wait_for_finish_blocking(chan0);
+            fill_buffer_ultrafast(buffer_0, phase_incs_down[i]);
+            dma_channel_set_read_addr(chan0, buffer_0, false);
+            dma_channel_wait_for_finish_blocking(chan1);
+            fill_buffer_ultrafast(buffer_1, phase_incs_down[i+1]);
+            dma_channel_set_read_addr(chan1, buffer_1, false);
+        }
+        printf(" Done\n");
+
+        // --- 4c. 1.0x Wrap-around UP from 60% ---
+        printf("1.0x UP (60%% wrap): ");
+        int start_idx = (ON_BUFFERS * 60 / 100);
+        if (start_idx % 2 != 0) start_idx++; 
+        for (int i = 0; i < ON_BUFFERS; i += 2) {
+            int b = (start_idx + i) % ON_BUFFERS;
+            int b_next = (start_idx + i + 1) % ON_BUFFERS;
             dma_channel_wait_for_finish_blocking(chan0);
             fill_buffer_ultrafast(buffer_0, phase_incs_up[b]);
             dma_channel_set_read_addr(chan0, buffer_0, false);
-            
             dma_channel_wait_for_finish_blocking(chan1);
-            if (b + 1 < ON_BUFFERS) {
-                fill_buffer_ultrafast(buffer_1, phase_incs_up[b+1]);
-                dma_channel_set_read_addr(chan1, buffer_1, false);
-            }
+            fill_buffer_ultrafast(buffer_1, phase_incs_up[b_next]);
+            dma_channel_set_read_addr(chan1, buffer_1, false);
         }
+        printf(" Done\n");
 
-        // --- 2. SWEEP DOWN (3 seconds) ---
-        printf("DOWN\n");
-        for (int b = 0; b < ON_BUFFERS; b += 2) {
-            dma_channel_wait_for_finish_blocking(chan0);
-            fill_buffer_ultrafast(buffer_0, phase_incs_down[b]);
-            dma_channel_set_read_addr(chan0, buffer_0, false);
-            
-            dma_channel_wait_for_finish_blocking(chan1);
-            if (b + 1 < ON_BUFFERS) {
-                fill_buffer_ultrafast(buffer_1, phase_incs_down[b+1]);
-                dma_channel_set_read_addr(chan1, buffer_1, false);
-            }
-        }
+        // 5. OFF PERIOD (1 second)
+        dma_channel_abort(chan0);
+        dma_channel_abort(chan1);
+        sleep_ms(10); // Hardware cooldown
+        pio_sm_set_enabled(pio, sm, false);
+        gpio_put(OUTPUT_PIN, 0); // Ensure pin is LOW
+        printf("OFF (1s)\n");
+        sleep_ms(1000);
     }
 }
 

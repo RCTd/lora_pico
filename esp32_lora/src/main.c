@@ -8,6 +8,7 @@
 #include <zephyr/sys/util.h>  
 #include <zephyr/sys/sys_heap.h>  
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/console/console.h>
 
 
 LOG_MODULE_REGISTER(IoTProj, LOG_LEVEL_INF);
@@ -19,6 +20,7 @@ LOG_MODULE_REGISTER(IoTProj, LOG_LEVEL_INF);
 #define PRIORITY_DISP 6  
 #define PRIORITY_EVT 3  
 #define PRIORITY_MON 2  
+#define PRIORITY_SER 2
   
 #define BTN_NODE      DT_ALIAS(sw0)  
 #define DISPLAY_NODE  DT_CHOSEN(zephyr_display)  
@@ -95,6 +97,7 @@ void lora_rx_thread(void);
 void lora_tx_thread(void);
 void display_thread(void);
 void monitor_thread(void);
+void serial_thread(void);
 
 /* ---------- Thread definitions ---------- */  
 K_THREAD_DEFINE(tid_evt,  STACK_SIZE, event_thread,  NULL, NULL, NULL,  
@@ -107,6 +110,8 @@ K_THREAD_DEFINE(tid_disp, STACK_SIZE, display_thread,NULL, NULL, NULL,
 		PRIORITY_DISP,0, 0);  
 K_THREAD_DEFINE(tid_mon,  STACK_SIZE, monitor_thread,NULL, NULL, NULL,  
 		PRIORITY_MON, 0, 0);  
+K_THREAD_DEFINE(tid_ser,  STACK_SIZE, serial_thread, NULL, NULL, NULL,
+		PRIORITY_SER, 0, 0);
 
 /* ---------- TASK 1 – EVENT_DISPATCH ---------- */  
 void event_thread(void)  
@@ -174,8 +179,9 @@ void lora_tx_thread(void)
             k_sleep(K_MSEC(100));  
         }
 
+        uint32_t uptime = k_uptime_get_32();
 		sys_put_le32(g_stats.tx_cnt, &frame[0]);  
-		sys_put_le32(k_uptime_get_32(), &frame[4]);  
+		sys_put_le32(uptime, &frame[4]);  
 
         LOG_INF("Send");  
 
@@ -183,7 +189,8 @@ void lora_tx_thread(void)
 
         int status = lora_send(lora_dev, frame, sizeof(frame));
 		if (status == 0) {  
-			LOG_INF("TX %u", g_stats.tx_cnt);  
+			LOG_INF("TX %u (Frame Hex) @%u", g_stats.tx_cnt, uptime);
+            LOG_HEXDUMP_INF(frame, sizeof(frame), "Packet Data:");
             k_mutex_lock(&disp_mutex, K_FOREVER);  
             g_stats.tx_cnt++;  
             k_mutex_unlock(&disp_mutex); 
@@ -250,6 +257,26 @@ void monitor_thread(void)
     }  
 }  
 
+/* ---------- TASK 5 – SERIAL_COMMAND ---------- */
+void serial_thread(void)
+{
+	if (console_init() != 0) {
+		LOG_ERR("Console init failed");
+		return;
+	}
+
+	for (;;) {
+		uint8_t c = console_getchar();
+		if (c == 's') {
+			LOG_INF("Serial command 's' received. Sending 5 packets...");
+			for (int i = 0; i < 5; i++) {
+				k_sem_give(&tx_sem);
+				k_sleep(K_SECONDS(1));
+			}
+			LOG_INF("Serial sequence finished.");
+		}
+	}
+}
   
 
   
