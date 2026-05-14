@@ -125,7 +125,7 @@ void play_symbol(int chan0, int chan1, uint32_t *base_incs, uint16_t symbol_shif
 }
 
 void core1_entry() {
-    printf("Core 1: LoRa-Mimic Started (865.03-865.17 MHz)\n");
+    printf("Core 1: LoRa-Mimic Started (865.1 MHz Center)\n");
     init_tables();
 
     PIO pio = pio0;
@@ -185,8 +185,8 @@ void core1_entry() {
             play_symbol(chan0, chan1, base_up_phase_incs, 0, 7, pio, sm);
         }
 
-        // 2. Sync Word
-        play_symbol(chan0, chan1, base_up_phase_incs, 0x12, 7, pio, sm);
+        // 2. Sync Word - SHIFT TEST: Change 0x12 to 0x40
+        play_symbol(chan0, chan1, base_up_phase_incs, 0x40, 7, pio, sm);
         play_symbol(chan0, chan1, base_up_phase_incs, 0x34, 7, pio, sm);
 
         // 3. SFD
