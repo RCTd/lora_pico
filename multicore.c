@@ -24,8 +24,8 @@ const double f_sample = 25000000.0;  // 25 MHz
 
 // Timing Parameters
 #define SAMPLES_PER_SEC 25000000ULL
-#define ON_SAMPLES      (2500000ULL) // 100ms at 25MHz
-#define ON_BUFFERS 76
+#define ON_SAMPLES      (12500000ULL) // 500ms at 25MHz
+#define ON_BUFFERS 381
 
 // Buffers are pre-calculated for "Symbol 0" (base up-chirp)
 uint32_t base_up_phase_incs[ON_BUFFERS];
