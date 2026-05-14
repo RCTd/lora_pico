@@ -16,10 +16,11 @@
 bi_decl(bi_program_description("Hardware-Accelerated Lora Chirp Generator"));
 bi_decl(bi_1pin_with_name(OUTPUT_PIN, "RF Output"));
 
-// Signal Parameters (Reverting to known-working range)
-const double f_low   = 865030000.0; 
-const double f_high  = 865170000.0; 
-const double bandwidth = 140000.0;
+// LoRa Parameters (Centering exactly at 865.1 MHz, 125kHz BW)
+const double f_center = 865100000.0;
+const double bandwidth = 125000.0;
+const double f_low    = f_center - bandwidth/2.0;
+const double f_high   = f_center + bandwidth/2.0;
 const double f_sample = 25000000.0;  // 25 MHz
 
 // Timing Parameters
@@ -34,11 +35,13 @@ uint32_t base_down_phase_incs[ON_BUFFERS];
 uint8_t bit_lookup[256];
 
 void init_tables() {
-    printf("Initializing lookup tables...\n");
+    printf("Initializing lookup tables (50%% Duty Cycle)...\n");
     for (int i = 0; i < 256; i++) {
         float val = sinf(2.0f * M_PI * i / 256.0f);
-        bit_lookup[i] = (val > 0.1f) ? 1 : 0;
+        // Use 0.0f for perfect 50% duty cycle to eliminate even harmonics
+        bit_lookup[i] = (val > 0.0f) ? 1 : 0;
     }
+
 
     for (int b = 0; b < ON_BUFFERS; b++) {
         double progress = (double)b / (double)ON_BUFFERS;
