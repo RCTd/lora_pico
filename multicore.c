@@ -149,13 +149,16 @@ void core1_entry() {
     pio_sm_config sm_c = lora_out_program_get_default_config(offset);
     sm_config_set_out_pins(&sm_c, OUTPUT_PIN, 1);
     sm_config_set_fifo_join(&sm_c, PIO_FIFO_JOIN_TX);
-    sm_config_set_out_shift(&sm_c, true, true, 32); 
+    sm_config_set_out_shift(&sm_c, false, true, 32); 
     sm_config_set_clkdiv(&sm_c, 5.0f); // 125 / 5 = 25 MHz
     pio_sm_init(pio, sm, offset, &sm_c);
 
     while (1) {
-        // 1. Hardware Reset Hard
+        // 1. Hardware Reset (Clean Abort)
         pio_sm_set_enabled(pio, sm, false);
+        dma_channel_abort(chan0);
+        dma_channel_abort(chan1);
+        
         pio_sm_restart(pio, sm);
         pio_sm_clkdiv_restart(pio, sm);
         pio_sm_clear_fifos(pio, sm);
