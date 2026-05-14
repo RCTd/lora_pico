@@ -5,6 +5,7 @@
 #include "pico/multicore.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
+#include "hardware/interp.h"
 #include "blink.pio.h"
 
 #include "pico/binary_info.h"
@@ -12,27 +13,26 @@
 #define OUTPUT_PIN 1
 #define BUFFER_SIZE 1024
 
-bi_decl(bi_program_description("High-speed Lora Chirp Generator"));
+bi_decl(bi_program_description("Hardware-Accelerated Lora Chirp Generator"));
 bi_decl(bi_1pin_with_name(OUTPUT_PIN, "RF Output"));
 
 // Signal Parameters
 const double f_low   = 865030000.0; 
 const double f_high  = 865170000.0; // 140 kHz sweep
-const double f_sample = 10000000.0;  // 10 MHz Bitrate (100ns per bit)
+const double f_sample = 25000000.0;  // 25 MHz Bitrate (40ns per bit)
 
 // Timing Parameters
-#define SAMPLES_PER_SEC 10000000ULL
+#define SAMPLES_PER_SEC 25000000ULL
 #define ON_SAMPLES      (3ULL * SAMPLES_PER_SEC)
 
-// Buffers per 3s burst: (3 * 10,000,000) / (1024 * 32) = ~915.5
-#define ON_BUFFERS 916
+// Buffers per 3s burst: (3 * 25,000,000) / (1024 * 32) = ~2288.8
+#define ON_BUFFERS 2288
 
 // Phase increments pre-calculated for each buffer
 uint32_t phase_incs_up[ON_BUFFERS];
 uint32_t phase_incs_down[ON_BUFFERS];
 
-// High-speed DDS state
-uint32_t phase_acc = 0;
+// High-speed DDS state (Hardware Interpolator will handle phase_acc)
 uint8_t bit_lookup[256];
 
 void init_tables() {
@@ -61,41 +61,45 @@ void init_tables() {
 uint32_t buffer_0[BUFFER_SIZE];
 uint32_t buffer_1[BUFFER_SIZE];
 
-// Optimized: Unrolled 4x and supports linear phase_inc stepping
+// Hardware-Accelerated: Uses RP2040 Interpolator for phase accumulation
 static inline void fill_buffer_optimized(uint32_t *buffer, uint32_t phase_inc, int32_t phase_inc_step) {
+    uint32_t current_phase_inc = phase_inc;
+
     for (size_t i = 0; i < BUFFER_SIZE; ++i) {
         uint32_t sample_word = 0;
+        
+        // Update hardware frequency for this word
+        interp0->base[0] = current_phase_inc;
 
-        // Process 32 bits, unrolled 4x for speed
+        // Process 32 bits, hardware handles the add and shift
         for (int b = 0; b < 8; b++) {
-            sample_word = (sample_word << 1) | bit_lookup[phase_acc >> 24];
-            phase_acc += phase_inc;
-            sample_word = (sample_word << 1) | bit_lookup[phase_acc >> 24];
-            phase_acc += phase_inc;
-            sample_word = (sample_word << 1) | bit_lookup[phase_acc >> 24];
-            phase_acc += phase_inc;
-            sample_word = (sample_word << 1) | bit_lookup[phase_acc >> 24];
-            phase_acc += phase_inc;
+            sample_word = (sample_word << 1) | bit_lookup[interp0->pop[0] >> 24];
+            sample_word = (sample_word << 1) | bit_lookup[interp0->pop[0] >> 24];
+            sample_word = (sample_word << 1) | bit_lookup[interp0->pop[0] >> 24];
+            sample_word = (sample_word << 1) | bit_lookup[interp0->pop[0] >> 24];
         }
         buffer[i] = sample_word;
 
-        // Update frequency every word (Smooth Chirp)
-        phase_inc += phase_inc_step;
+        // Smoothly interpolate frequency for the next word
+        current_phase_inc += phase_inc_step;
     }
 }
 
 // Helper to run a sweep with optimized interpolation and progress logging
 void run_sweep_optimized(int chan0, int chan1, uint32_t *phase_incs, int start_index, int total_to_play) {
     for (int i = 0; i < total_to_play; i += 2) {
-        if (i % 200 == 0) { printf("."); fflush(stdout); }
+        if (i % 400 == 0) { printf("."); fflush(stdout); }
         
         int b = (start_index + i) % ON_BUFFERS;
         int b_next = (start_index + i + 1) % ON_BUFFERS;
         int b_after = (start_index + i + 2) % ON_BUFFERS;
 
-        // Calculate steps for frequency interpolation
-        int32_t s = (int32_t)((phase_incs[b_next] - phase_incs[b]) / BUFFER_SIZE);
-        int32_t s_next = (int32_t)((phase_incs[b_after] - phase_incs[b_next]) / BUFFER_SIZE);
+        // Calculate steps for frequency interpolation (Must use signed arithmetic!)
+        int32_t diff = (int32_t)(phase_incs[b_next] - phase_incs[b]);
+        int32_t s = diff / (int32_t)BUFFER_SIZE;
+
+        int32_t diff_next = (int32_t)(phase_incs[b_after] - phase_incs[b_next]);
+        int32_t s_next = diff_next / (int32_t)BUFFER_SIZE;
 
         dma_channel_wait_for_finish_blocking(chan0);
         fill_buffer_optimized(buffer_0, phase_incs[b], s);
@@ -108,7 +112,7 @@ void run_sweep_optimized(int chan0, int chan1, uint32_t *phase_incs, int start_i
 }
 
 void core1_entry() {
-    printf("Core 1: Optimized Robust Chirp Started\n");
+    printf("Core 1: Hardware-Accelerated Chirp Started (25 MHz)\n");
     init_tables();
 
     PIO pio = pio0;
@@ -117,6 +121,11 @@ void core1_entry() {
 
     pio_gpio_init(pio, OUTPUT_PIN);
     pio_sm_set_consecutive_pindirs(pio, sm, OUTPUT_PIN, 1, true);
+
+    // --- Configure Interpolator 0 ---
+    interp_config cfg = interp_default_config();
+    interp_config_set_add_raw(&cfg, true); // Essential for phase accumulation
+    interp_set_config(interp0, 0, &cfg);
 
     int chan0 = dma_claim_unused_channel(true);
     int chan1 = dma_claim_unused_channel(true);
@@ -141,25 +150,25 @@ void core1_entry() {
     sm_config_set_out_pins(&sm_c, OUTPUT_PIN, 1);
     sm_config_set_fifo_join(&sm_c, PIO_FIFO_JOIN_TX);
     sm_config_set_out_shift(&sm_c, true, true, 32); 
-    sm_config_set_clkdiv(&sm_c, 12.5f); 
+    sm_config_set_clkdiv(&sm_c, 5.0f); // 125 / 5 = 25 MHz
     pio_sm_init(pio, sm, offset, &sm_c);
 
     while (1) {
-        // 1. Reset PIO SM Hard
+        // 1. Hardware Reset Hard
         pio_sm_set_enabled(pio, sm, false);
         pio_sm_restart(pio, sm);
         pio_sm_clkdiv_restart(pio, sm);
         pio_sm_clear_fifos(pio, sm);
         pio_sm_exec(pio, sm, pio_encode_jmp(offset));
 
-        // 2. Reset state and fill initial buffers
-        phase_acc = 0;
+        // 2. Reset state (Phase and Hardware Accumulator)
+        interp0->accum[0] = 0;
         int32_t step_up = (int32_t)((phase_incs_up[1] - phase_incs_up[0]) / BUFFER_SIZE);
         fill_buffer_optimized(buffer_0, phase_incs_up[0], step_up);
         fill_buffer_optimized(buffer_1, phase_incs_up[1], step_up);
 
         // 3. Start Sequence
-        printf("Starting Optimized Sequence...\n");
+        printf("Starting 25 MHz Sequence...\n");
         pio_sm_set_enabled(pio, sm, true);
         dma_channel_configure(chan1, &c1, &pio->txf[sm], buffer_1, BUFFER_SIZE, false);
         dma_channel_configure(chan0, &c0, &pio->txf[sm], buffer_0, BUFFER_SIZE, true); 
