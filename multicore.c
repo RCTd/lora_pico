@@ -46,10 +46,10 @@ static inline void fill_buffer_optimized(uint32_t *buffer, uint32_t phase_inc, i
         uint32_t sample_word = 0;
         interp0->base[0] = phase_inc; 
         for (int b = 0; b < 8; b++) {
-            sample_word = (sample_word >> 1) | (interp0->pop[0] & 0x80000000);
-            sample_word = (sample_word >> 1) | (interp0->pop[0] & 0x80000000);
-            sample_word = (sample_word >> 1) | (interp0->pop[0] & 0x80000000);
-            sample_word = (sample_word >> 1) | (interp0->pop[0] & 0x80000000);
+            sample_word = (sample_word << 1) | (interp0->pop[0] >> 31);
+            sample_word = (sample_word << 1) | (interp0->pop[0] >> 31);
+            sample_word = (sample_word << 1) | (interp0->pop[0] >> 31);
+            sample_word = (sample_word << 1) | (interp0->pop[0] >> 31);
         }
         buffer[i] = sample_word;
         phase_inc += phase_inc_step;
@@ -80,6 +80,8 @@ void play_symbol(int chan0, int chan1, uint32_t *base_incs, uint16_t symbol_shif
 }
 
 // --- LoRa Encoding Logic ---
+// --- LoRa Encoding Logic (Standard-Compliant) ---
+
 static uint8_t headerChecksum(const uint8_t *h) {
     int a0 = (h[0] >> 4) & 0x1; int a1 = (h[0] >> 5) & 0x1; int a2 = (h[0] >> 6) & 0x1; int a3 = (h[0] >> 7) & 0x1;
     int b0 = (h[0] >> 0) & 0x1; int b1 = (h[0] >> 1) & 0x1; int b2 = (h[0] >> 2) & 0x1; int b3 = (h[0] >> 3) & 0x1;
@@ -95,17 +97,20 @@ static uint16_t crc16sx(uint16_t crc, const uint16_t poly) {
     return crc;
 }
 
+static uint8_t xsum8(uint8_t t) {
+    t ^= t >> 4; t ^= t >> 2; t ^= t >> 1;
+    return (t & 1);
+}
+
 static uint16_t sx1272DataChecksum(const uint8_t *data, int length) {
     uint16_t res = 0; uint8_t v = 0xff;
     for (int i = 0; i < length; i++) {
         uint16_t crc = crc16sx(res, 0x1021);
-        uint8_t t = v ^ (v >> 4); t ^= t >> 2; t ^= t >> 1;
-        v = (t & 1) | (v << 1);
+        v = xsum8(v & 0xB8) | (v << 1);
         res = crc ^ data[i];
     }
     res ^= v; 
-    uint8_t t = v ^ (v >> 4); t ^= t >> 2; t ^= t >> 1;
-    v = (t & 1) | (v << 1);
+    v = xsum8(v & 0xB8) | (v << 1);
     res ^= (uint16_t)v << 8;
     return res;
 }
@@ -118,18 +123,6 @@ static unsigned char encodeHamming84sx(const unsigned char x) {
 static unsigned char encodeParity54(const unsigned char b) {
     int x = b ^ (b >> 2); x = x ^ (x >> 1);
     return (b & 0xf) | ((x << 4) & 0x10);
-}
-
-static void Sx1272ComputeWhitening(uint8_t *buffer, uint16_t bufferSize) {
-    uint64_t r = 0x6572D100E85C2EFF;
-    for (int j = 0; j < bufferSize; j++) {
-        buffer[j] ^= r & 0xff;
-        r = (r >> 8) | (((r >> 32) ^ (r >> 24) ^ (r >> 16) ^ r) << 56);
-    }
-}
-
-static unsigned short binaryToGray16(unsigned short num) {
-    return num ^ (num >> 1);
 }
 
 static void diagonalInterleaveSx(const uint8_t *codewords, size_t numCodewords, uint16_t *symbols, size_t sf, size_t rdd) {
@@ -149,46 +142,79 @@ static void diagonalInterleaveSx(const uint8_t *codewords, size_t numCodewords, 
     }
 }
 
-int encode_lora(uint16_t *symbols, const uint8_t *payload, int len, int sf, int cr) {
-    uint8_t data[255+2];
-    memcpy(data, payload, len);
+static unsigned short binaryToGray16(unsigned short num) {
+    return num ^ (num >> 1);
+}
+
+static void Sx1272ComputeWhitening(uint8_t *buffer, uint16_t bufferSize, const int bitOfs, const int RDD) {
+    static const int ofs0[8] = {6,4,2,0,-112,-114,-302,-34 };
+    static const int ofs1[5] = {6,4,2,0,-360 };
+    static const int whiten_len = 510;
+    static const uint64_t whiten_seq[8] = {
+        0x0102291EA751AAFFL,0xD24B050A8D643A17L,0x5B279B671120B8F4L,0x032B37B9F6FB55A2L,
+        0x994E0F87E95E2D16L,0x7CBCFC7631984C26L,0x281C8E4F0DAEF7F9L,0x1741886EB7733B15L
+    };
+    const int *ofs = (1 == RDD) ? ofs1 : ofs0;
+    for (int j = 0; j < bufferSize; j++) {
+        uint8_t x = 0;
+        for (int i = 0; i < 4 + RDD; i++) {
+            int t = (ofs[i] + j + bitOfs + whiten_len) % whiten_len;
+            if (whiten_seq[t >> 6] & ((uint64_t)1 << (t & 0x3F))) x |= 1 << i;
+        }
+        buffer[j] ^= x;
+    }	
+}
+
+static unsigned short grayToBinary16(unsigned short num) {
+    num = num ^ (num >> 8); num = num ^ (num >> 4); num = num ^ (num >> 2); num = num ^ (num >> 1);
+    return num;
+}
+
+int encode_lora(uint16_t *symbols, const uint8_t *payload, int len, int sf, int rdd) {
+    uint8_t data[255+2]; memcpy(data, payload, len);
     uint16_t crc = sx1272DataChecksum(data, len);
     data[len] = crc & 0xff; data[len+1] = (crc >> 8) & 0xff;
-    int full_len = len + 2;
+    
+    int nHeaderCodewords = 8; // For SF10
+    int header_shift = (sf > 6) ? 2 : 0;
+    int header_sf = sf - header_shift;
+
+    int total_payload_nibbles = (len + 2) * 2;
+    int numCodewords = ((total_payload_nibbles + nHeaderCodewords + sf - 1) / sf) * sf;
     uint8_t codewords[512]; memset(codewords, 0, sizeof(codewords));
-    int cOfs = 0;
+    
     uint8_t hdr[3];
-    hdr[0] = len; hdr[1] = (1 << 0) | ((cr - 1) << 1); hdr[2] = headerChecksum(hdr);
+    hdr[0] = len; hdr[1] = (1 /* CRC present */) | (rdd << 1); hdr[2] = headerChecksum(hdr);
+    
+    int cOfs = 0;
     codewords[cOfs++] = encodeHamming84sx(hdr[0] >> 4);
     codewords[cOfs++] = encodeHamming84sx(hdr[0] & 0xf);
     codewords[cOfs++] = encodeHamming84sx(hdr[1] & 0xf);
     codewords[cOfs++] = encodeHamming84sx(hdr[2] >> 4);
     codewords[cOfs++] = encodeHamming84sx(hdr[2] & 0xf);
+    while (cOfs < nHeaderCodewords) codewords[cOfs++] = 0; // Pad header to 8
     
-    int header_sf = (sf > 6) ? sf - 2 : sf;
-    int header_shift = (sf > 6) ? 2 : 0;
-
-    while (cOfs < header_sf) codewords[cOfs++] = 0; 
-    int payload_start_bit = cOfs;
-    for (int i = 0; i < full_len; i++) {
-        codewords[cOfs++] = encodeParity54(data[i] & 0xf);
-        codewords[cOfs++] = encodeParity54(data[i] >> 4);
+    int dOfs = 0;
+    for (int i = 0; i < total_payload_nibbles; i++) {
+        uint8_t nibble = (i % 2 == 0) ? (data[i/2] & 0xf) : (data[i/2] >> 4);
+        if (rdd == 1) codewords[cOfs++] = encodeParity54(nibble);
+        else if (rdd == 4) codewords[cOfs++] = encodeHamming84sx(nibble);
     }
-    while ((cOfs - payload_start_bit) % sf != 0) codewords[cOfs++] = 0; 
-    
+    while (cOfs < numCodewords) codewords[cOfs++] = 0;
+
     // Whitening
-    Sx1272ComputeWhitening(codewords, header_sf); // Header whitening
-    Sx1272ComputeWhitening(codewords + header_sf, cOfs - header_sf); // Payload whitening
-    
+    Sx1272ComputeWhitening(codewords, header_sf, 0, 4); // Header
+    Sx1272ComputeWhitening(codewords + header_sf, numCodewords - header_sf, header_sf, rdd); // Payload
+
     uint16_t raw_symbols[512]; memset(raw_symbols, 0, sizeof(raw_symbols));
     diagonalInterleaveSx(codewords, header_sf, raw_symbols, header_sf, 4);
-    if (cOfs > header_sf) diagonalInterleaveSx(codewords + header_sf, cOfs - header_sf, raw_symbols + 8, sf, cr - 1);
+    diagonalInterleaveSx(codewords + nHeaderCodewords, numCodewords - nHeaderCodewords, raw_symbols + 8, sf, rdd);
     
-    int sym_count = 8 + ((cOfs - header_sf) / sf) * (4 + cr - 1);
+    int sym_count = 8 + ((numCodewords - nHeaderCodewords) / sf) * (4 + rdd);
     for (int i = 0; i < sym_count; i++) {
-        uint16_t s = raw_symbols[i];
+        uint16_t s = grayToBinary16(raw_symbols[i]); 
         if (i < 8) s <<= header_shift;
-        symbols[i] = binaryToGray16(s);
+        symbols[i] = binaryToGray16(s); 
     }
     return sym_count;
 }
@@ -230,7 +256,7 @@ void core1_entry() {
     pio_sm_config sm_c = lora_out_program_get_default_config(offset);
     sm_config_set_out_pins(&sm_c, OUTPUT_PIN, 1);
     sm_config_set_fifo_join(&sm_c, PIO_FIFO_JOIN_TX);
-    sm_config_set_out_shift(&sm_c, true, true, 32); 
+    sm_config_set_out_shift(&sm_c, false, true, 32); 
     sm_config_set_clkdiv(&sm_c, 5.0f); 
     pio_sm_init(pio, sm, offset, &sm_c);
 
@@ -255,9 +281,9 @@ void core1_entry() {
         // Targeted RF at 865.1MHz (25MSps) - Forward image behavior.
         // base_up (baseband up-chirp) results in an up-chirp at RF.
         for(int i=0; i<12; i++) play_symbol(chan0, chan1, base_up_phase_incs, 0, pio, sm);
-        // Sync Word
-        play_symbol(chan0, chan1, base_up_phase_incs, 0x1 << 2, pio, sm);
-        play_symbol(chan0, chan1, base_up_phase_incs, 0x2 << 2, pio, sm);
+        // Sync Word (Public: 0x34 -> symbols 3 and 4 shifted)
+        play_symbol(chan0, chan1, base_up_phase_incs, 0x3 << (10 - 4), pio, sm);
+        play_symbol(chan0, chan1, base_up_phase_incs, 0x4 << (10 - 4), pio, sm);
         // SFD (2.25 symbols) - must be down-chirps at RF, so use base_down.
         play_symbol(chan0, chan1, base_down_phase_incs, 0, pio, sm);
         play_symbol(chan0, chan1, base_down_phase_incs, 0, pio, sm);
