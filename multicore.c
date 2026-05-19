@@ -92,7 +92,6 @@ void play_partial_symbol(uint8_t *chirp_buf, uint16_t symbol_shift, int num_byte
     }
 }
 
-// --- LoRa Encoding Logic ---
 static unsigned char encodeHamming84sx(const unsigned char x) {
     int d0 = (x >> 0) & 0x1; int d1 = (x >> 1) & 0x1; int d2 = (x >> 2) & 0x1; int d3 = (x >> 3) & 0x1;
     return (x & 0xf) | ((d0 ^ d1 ^ d2) << 4) | ((d1 ^ d2 ^ d3) << 5) | ((d0 ^ d1 ^ d3) << 6) | ((d0 ^ d2 ^ d3) << 7);
@@ -122,23 +121,26 @@ static void diagonalInterleaveSx(const uint8_t *codewords, const size_t numCodew
 int encode_lora(uint16_t *symbols, const uint8_t *payload, int len, int sf, int rdd) {
     uint8_t codewords[512]; memset(codewords, 0, sizeof(codewords));
     memset(symbols, 0, 512 * sizeof(uint16_t));
+    uint8_t whitening[] = {0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00};
     codewords[0] = encodeHamming84sx(0);
-    codewords[1] = encodeHamming84sx(len);
-    codewords[2] = encodeHamming84sx(9);
-    codewords[3] = encodeHamming84sx(0);
-    codewords[4] = encodeHamming84sx(0);
-    uint8_t final_seq[] = {0xb7, 0xbb, 0x53, 0xf4, 0xbf};
+    codewords[1] = encodeHamming84sx(len & 0xf);
+    codewords[2] = encodeHamming84sx(len >> 4);
+    codewords[3] = encodeHamming84sx(0x08); 
+    codewords[4] = encodeHamming84sx(0);    
+
     for(int i=0; i<len; i++) {
-        codewords[5 + i*2] = encodeHamming84sx(final_seq[i] & 0xf);
-        codewords[5 + i*2 + 1] = encodeHamming84sx(final_seq[i] >> 4);
+        uint8_t val = payload[i] ^ whitening[i % 16]; 
+        codewords[8 + i*2] = encodeHamming84sx(val & 0xf);
+        codewords[8 + i*2 + 1] = encodeHamming84sx(val >> 4);
     }
     diagonalInterleaveSx(codewords, 8, symbols, 8, 4);
-    diagonalInterleaveSx(codewords + 8, 20, symbols + 8, sf, 4);
-    for (int i = 0; i < 32; i++) {
+    int num_payload_codewords = len * 2;
+    diagonalInterleaveSx(codewords + 8, num_payload_codewords, symbols + 8, sf, 4);
+    for (int i = 0; i < 8 + (len*2); i++) {
         symbols[i] = grayToBinary16(symbols[i]);
         if (i < 8) symbols[i] <<= 2;
     }
-    return 32;
+    return 8 + (len * 2);
 }
 
 void core1_entry() {
@@ -172,15 +174,16 @@ void core1_entry() {
     sm_config_set_out_pins(&sm_c, OUTPUT_PIN, 1);
     sm_config_set_fifo_join(&sm_c, PIO_FIFO_JOIN_TX);
     sm_config_set_out_shift(&sm_c, true, true, 8);
-    sm_config_set_clkdiv(&sm_c, 2.0f); // 125MHz / 2.0 = 62.5MHz
+    sm_config_set_clkdiv(&sm_c, 2.0f); 
     pio_sm_init(pio, sm, offset, &sm_c);
 
     uint16_t symbols[512];
     uint8_t payload[] = "HELLO";
-    int sym_count = encode_lora(symbols, payload, 5, 10, 4);
+    int payload_len = strlen((char*)payload);
+    int sym_count = encode_lora(symbols, payload, payload_len, 10, 4);
     
     while (1) {
-        printf("TX 62.5MHz 'HELLO'..."); fflush(stdout);
+        printf("TX 62.5MHz '%s'...", payload); fflush(stdout);
         pio_sm_set_enabled(pio, sm, false);
         dma_channel_abort(chan0); dma_channel_abort(chan1);
         pio_sm_restart(pio, sm); pio_sm_clkdiv_restart(pio, sm);
