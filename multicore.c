@@ -5,87 +5,76 @@
 #include "pico/multicore.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
-#include "hardware/interp.h"
 #include "hardware/clocks.h"
 #include "blink.pio.h"
 
 #include "pico/binary_info.h"
 
 #define OUTPUT_PIN 1
-#define BUFFER_SIZE 16 
-#define ON_BUFFERS 400
 
 bi_decl(bi_program_description("Hardware-Accelerated LoRa Chirp Generator"));
 bi_decl(bi_1pin_with_name(OUTPUT_PIN, "RF Output"));
 
-const double f_center = 865100000.0;
+const double f_center = 865099975.5859375; // Tweaked slightly to ensure exact phase periodicity over 1 chirp
 const double bandwidth = 125000.0;
 const double f_low    = f_center - bandwidth/2.0;
 const double f_high   = f_center + bandwidth/2.0;
 const double f_sample = 25000000.0; 
+const double T_chirp  = 0.008192; // exactly 1024 / 125000
 
-uint32_t base_up_phase_incs[ON_BUFFERS];
-uint32_t base_down_phase_incs[ON_BUFFERS];
+uint8_t double_up_chirp[51200];
+uint8_t double_down_chirp[51200];
 
 void init_tables() {
-    for (int b = 0; b < ON_BUFFERS; b++) {
-        double progress = (double)b / (double)ON_BUFFERS;
-        double f_up = progress * bandwidth + f_low;
-        base_up_phase_incs[b] = (uint32_t)((f_up / f_sample - floor(f_up / f_sample)) * 4294967296.0);
-        double f_down = (1.0 - progress) * bandwidth + f_low;
-        base_down_phase_incs[b] = (uint32_t)((f_down / f_sample - floor(f_down / f_sample)) * 4294967296.0);
-    }
-}
-
-uint32_t buffer_0[BUFFER_SIZE];
-uint32_t buffer_1[BUFFER_SIZE];
-
-static inline void fill_buffer_optimized(uint32_t *buffer, uint32_t phase_inc, int32_t phase_inc_step) {
-    for (size_t i = 0; i < BUFFER_SIZE; ++i) {
-        uint32_t sample_word = 0;
-        interp0->base[0] = phase_inc; 
+    printf("Generating perfect double-chirps...\n");
+    for (int i = 0; i < 25600; i++) {
+        uint8_t byte_up = 0;
+        uint8_t byte_down = 0;
         for (int b = 0; b < 8; b++) {
-            sample_word = (sample_word << 1) | (interp0->pop[0] >> 31);
-            sample_word = (sample_word << 1) | (interp0->pop[0] >> 31);
-            sample_word = (sample_word << 1) | (interp0->pop[0] >> 31);
-            sample_word = (sample_word << 1) | (interp0->pop[0] >> 31);
+            int t_idx = i * 8 + b;
+            double t = (double)t_idx / f_sample;
+            
+            // Integrate phase: phi = f_start * t + (bandwidth / 2T) * t^2
+            double phase_up = f_low * t + (bandwidth / (2.0 * T_chirp)) * t * t;
+            double phase_down = f_high * t - (bandwidth / (2.0 * T_chirp)) * t * t;
+            
+            phase_up = phase_up - floor(phase_up);
+            phase_down = phase_down - floor(phase_down);
+            
+            uint8_t bit_up = (phase_up >= 0.5) ? 1 : 0;
+            uint8_t bit_down = (phase_down >= 0.5) ? 1 : 0;
+            
+            // Pack bits LSB first for PIO
+            byte_up = (byte_up >> 1) | (bit_up << 7);
+            byte_down = (byte_down >> 1) | (bit_down << 7);
         }
-        buffer[i] = sample_word;
-        phase_inc += phase_inc_step;
+        double_up_chirp[i] = byte_up;
+        double_down_chirp[i] = byte_down;
+        
+        // Phase continuity tweak guarantees that the bit pattern repeats exactly every T_chirp.
+        double_up_chirp[i + 25600] = byte_up;
+        double_down_chirp[i + 25600] = byte_down;
     }
+    printf("Chirps ready.\n");
 }
 
-void run_sweep_optimized(int chan0, int chan1, uint32_t *phase_incs, int start_index, int total_to_play) {
-    for (int i = 0; i < total_to_play; i += 2) {
-        int b = (start_index + i) % ON_BUFFERS;
-        int b_next = (start_index + i + 1) % ON_BUFFERS;
-        int b_after = (start_index + i + 2) % ON_BUFFERS;
-        int32_t s = (int32_t)(phase_incs[b_next] - phase_incs[b]) / BUFFER_SIZE;
-        int32_t s_next = (int32_t)(phase_incs[b_after] - phase_incs[b_next]) / BUFFER_SIZE;
-        dma_channel_wait_for_finish_blocking(chan0);
-        fill_buffer_optimized(buffer_0, phase_incs[b], s);
-        dma_channel_set_read_addr(chan0, buffer_0, false);
-        dma_channel_wait_for_finish_blocking(chan1);
-        fill_buffer_optimized(buffer_1, phase_incs[b_next], s_next);
-        dma_channel_set_read_addr(chan1, buffer_1, false);
-    }
+void play_symbol(int chan0, uint8_t *chirp_buf, uint16_t symbol_shift, PIO pio, uint sm) {
+    uint32_t byte_offset = symbol_shift * 25; // 25600 bytes / 1024 symbols = 25 bytes per symbol increment
+    dma_channel_wait_for_finish_blocking(chan0);
+    dma_channel_set_read_addr(chan0, chirp_buf + byte_offset, true);
 }
 
-void play_symbol(int chan0, int chan1, uint32_t *base_incs, uint16_t symbol_shift, PIO pio, uint sm) {
-    uint32_t scaled_shift = (uint32_t)symbol_shift * ON_BUFFERS / 1024;
-    int wrap_point = scaled_shift % ON_BUFFERS;
-    if (wrap_point % 2 != 0) wrap_point++; 
-    run_sweep_optimized(chan0, chan1, base_incs, wrap_point, ON_BUFFERS);
+void play_partial_symbol(int chan0, uint8_t *chirp_buf, uint16_t symbol_shift, int num_bytes, PIO pio, uint sm) {
+    uint32_t byte_offset = symbol_shift * 25;
+    dma_channel_wait_for_finish_blocking(chan0);
+    dma_channel_set_trans_count(chan0, num_bytes, false);
+    dma_channel_set_read_addr(chan0, chirp_buf + byte_offset, true);
+    dma_channel_wait_for_finish_blocking(chan0);
+    // Reset trans count back to full symbol size for next calls
+    dma_channel_set_trans_count(chan0, 25600, false);
 }
 
-void play_partial_symbol(int chan0, int chan1, uint32_t *base_incs, uint16_t symbol_shift, int total_buffers, PIO pio, uint sm) {
-    uint32_t scaled_shift = (uint32_t)symbol_shift * ON_BUFFERS / 1024;
-    int wrap_point = scaled_shift % ON_BUFFERS;
-    if (wrap_point % 2 != 0) wrap_point++; 
-    run_sweep_optimized(chan0, chan1, base_incs, wrap_point, total_buffers);
-}
-
-// --- LoRa Encoding Logic (Absolute Final Match) ---
+// --- LoRa Encoding Logic (Standard-Compliant) ---
 
 static unsigned char encodeHamming84sx(const unsigned char x) {
     int d0 = (x >> 0) & 0x1; int d1 = (x >> 1) & 0x1; int d2 = (x >> 2) & 0x1; int d3 = (x >> 3) & 0x1;
@@ -117,7 +106,7 @@ int encode_lora(uint16_t *symbols, const uint8_t *payload, int len, int sf, int 
     uint8_t codewords[512]; memset(codewords, 0, sizeof(codewords));
     memset(symbols, 0, 512 * sizeof(uint16_t));
 
-    // Header
+    // Header: 8 codewords for SF10
     codewords[0] = encodeHamming84sx(0);
     codewords[1] = encodeHamming84sx(len);
     codewords[2] = encodeHamming84sx(9);
@@ -142,34 +131,25 @@ int encode_lora(uint16_t *symbols, const uint8_t *payload, int len, int sf, int 
 }
 
 void core1_entry() {
-    printf("Core 1: LoRa Final Absolute Running\n");
+    printf("Core 1: LoRa Exact DMA running\n");
     init_tables();
     PIO pio = pio0;
     uint offset = pio_add_program(pio, &lora_out_program);
     uint sm = pio_claim_unused_sm(pio, true);
     pio_gpio_init(pio, OUTPUT_PIN);
     pio_sm_set_consecutive_pindirs(pio, sm, OUTPUT_PIN, 1, true);
-    interp_config cfg = interp_default_config();
-    interp_config_set_add_raw(&cfg, true);
-    interp_set_config(interp0, 0, &cfg);
+    
     int chan0 = dma_claim_unused_channel(true);
-    int chan1 = dma_claim_unused_channel(true);
     dma_channel_config c0 = dma_channel_get_default_config(chan0);
-    channel_config_set_transfer_data_size(&c0, DMA_SIZE_32);
+    channel_config_set_transfer_data_size(&c0, DMA_SIZE_8);
     channel_config_set_read_increment(&c0, true);
     channel_config_set_write_increment(&c0, false);
     channel_config_set_dreq(&c0, pio_get_dreq(pio, sm, true));
-    channel_config_set_chain_to(&c0, chan1);
-    dma_channel_config c1 = dma_channel_get_default_config(chan1);
-    channel_config_set_transfer_data_size(&c1, DMA_SIZE_32);
-    channel_config_set_read_increment(&c1, true);
-    channel_config_set_write_increment(&c1, false);
-    channel_config_set_dreq(&c1, pio_get_dreq(pio, sm, true));
-    channel_config_set_chain_to(&c1, chan0);
+    
     pio_sm_config sm_c = lora_out_program_get_default_config(offset);
     sm_config_set_out_pins(&sm_c, OUTPUT_PIN, 1);
     sm_config_set_fifo_join(&sm_c, PIO_FIFO_JOIN_TX);
-    sm_config_set_out_shift(&sm_c, false, true, 32); 
+    sm_config_set_out_shift(&sm_c, true, true, 8); // RIGHT (LSB first), autopull, 8 bits
     sm_config_set_clkdiv(&sm_c, 5.0f); 
     pio_sm_init(pio, sm, offset, &sm_c);
 
@@ -178,29 +158,31 @@ void core1_entry() {
     int sym_count = encode_lora(symbols, payload, 5, 10, 4);
     
     while (1) {
-        printf("TX Packet (Absolute Final 'HELLO')..."); fflush(stdout);
+        printf("TX Packet (Optimized DMA 'HELLO')..."); fflush(stdout);
         pio_sm_set_enabled(pio, sm, false);
-        dma_channel_abort(chan0); dma_channel_abort(chan1);
+        dma_channel_abort(chan0);
         pio_sm_restart(pio, sm); pio_sm_clkdiv_restart(pio, sm);
         pio_sm_clear_fifos(pio, sm); pio_sm_exec(pio, sm, pio_encode_jmp(offset));
-        interp0->accum[0] = 0;
-        int32_t step_up = (int32_t)((base_up_phase_incs[1] - base_up_phase_incs[0]) / BUFFER_SIZE);
-        fill_buffer_optimized(buffer_0, base_up_phase_incs[0], step_up);
-        fill_buffer_optimized(buffer_1, base_up_phase_incs[1], step_up);
+        
         pio_sm_set_enabled(pio, sm, true);
-        dma_channel_configure(chan1, &c1, &pio->txf[sm], buffer_1, BUFFER_SIZE, false);
-        dma_channel_configure(chan0, &c0, &pio->txf[sm], buffer_0, BUFFER_SIZE, true); 
+        dma_channel_configure(chan0, &c0, &pio->txf[sm], NULL, 25600, false); 
 
-        for(int i=0; i<8; i++) play_symbol(chan0, chan1, base_up_phase_incs, 0, pio, sm);
-        play_symbol(chan0, chan1, base_up_phase_incs, 192, pio, sm);
-        play_symbol(chan0, chan1, base_up_phase_incs, 256, pio, sm);
-        play_symbol(chan0, chan1, base_down_phase_incs, 0, pio, sm);
-        play_symbol(chan0, chan1, base_down_phase_incs, 0, pio, sm);
-        play_partial_symbol(chan0, chan1, base_down_phase_incs, 0, ON_BUFFERS / 4, pio, sm); 
+        // Preamble
+        for(int i=0; i<8; i++) play_symbol(chan0, double_up_chirp, 0, pio, sm);
+        // Sync
+        play_symbol(chan0, double_up_chirp, 192, pio, sm);
+        play_symbol(chan0, double_up_chirp, 256, pio, sm);
+        // Downchirps
+        play_symbol(chan0, double_down_chirp, 0, pio, sm);
+        play_symbol(chan0, double_down_chirp, 0, pio, sm);
+        play_partial_symbol(chan0, double_down_chirp, 0, 6400, pio, sm); 
 
-        for(int i=0; i<sym_count; i++) play_symbol(chan0, chan1, base_up_phase_incs, symbols[i], pio, sm);
+        // Payload
+        for(int i=0; i<sym_count; i++) play_symbol(chan0, double_up_chirp, symbols[i], pio, sm);
+        
+        dma_channel_wait_for_finish_blocking(chan0);
+        sleep_us(100); // drain
         printf(" Done\n");
-        dma_channel_abort(chan0); dma_channel_abort(chan1);
         pio_sm_set_enabled(pio, sm, false);
         gpio_put(OUTPUT_PIN, 0); 
         sleep_ms(3000);
@@ -210,7 +192,7 @@ void core1_entry() {
 int main() {
     set_sys_clock_khz(125000, true);
     stdio_init_all();
-    printf("Pico W: LoRa Absolute Final at 125MHz\n");
+    printf("Pico W: LoRa Optimized Encoder at 125MHz\n");
     multicore_launch_core1(core1_entry);
     while (1) tight_loop_contents();
 }
