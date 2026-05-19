@@ -94,53 +94,76 @@ void play_partial_symbol(uint8_t *chirp_buf, uint16_t symbol_shift, int num_byte
 
 static unsigned char encodeHamming84sx(const unsigned char x) {
     int d0 = (x >> 0) & 0x1; int d1 = (x >> 1) & 0x1; int d2 = (x >> 2) & 0x1; int d3 = (x >> 3) & 0x1;
-    return (x & 0xf) | ((d0 ^ d1 ^ d2) << 4) | ((d1 ^ d2 ^ d3) << 5) | ((d0 ^ d1 ^ d3) << 6) | ((d0 ^ d2 ^ d3) << 7);
+    int p4 = d0 ^ d1 ^ d2;
+    int p5 = d1 ^ d2 ^ d3;
+    int p6 = d0 ^ d1 ^ d3;
+    int p7 = d0 ^ d2 ^ d3;
+    return (x & 0xf) | (p4 << 4) | (p5 << 5) | (p6 << 6) | (p7 << 7);
 }
 
-static unsigned short grayToBinary16(unsigned short num) {
-    num = num ^ (num >> 8); num = num ^ (num >> 4); num = num ^ (num >> 2); num = num ^ (num >> 1);
-    return num;
+static unsigned short binaryToGray(unsigned short num) {
+    return num ^ (num >> 1);
 }
 
-static void diagonalInterleaveSx(const uint8_t *codewords, const size_t numCodewords, uint16_t *symbols, const size_t PPM, const size_t RDD){
-	for (size_t x = 0; x < numCodewords / PPM; x++)	{
-		const size_t cwOff = x*PPM;
-		const size_t symOff = x*(4 + RDD);
-		for (size_t k = 0; k < 4 + RDD; k++){
-			uint16_t s = symbols[symOff + k];
-			for (size_t m = 0; m < PPM; m++){
-				const size_t i = (m + k + PPM) % PPM;
-				const int bit = (codewords[cwOff + i] >> k) & 0x1;
-				s |= (bit << m);
-			}
-			symbols[symOff + k] = s;
-		}
-	}
-}
+static const uint8_t whitening_seq[] = {
+    0xFF, 0xFE, 0xFC, 0xF8, 0xF0, 0xE1, 0xC2, 0x85, 0x0B, 0x17, 0x2F, 0x5E, 0xBC, 0x78, 0xF1, 0xE3,
+    0xC6, 0x8D, 0x1A, 0x34, 0x68, 0xD0, 0xA0, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x11, 0x23, 0x47,
+    0x8E, 0x1C, 0x38, 0x71, 0xE2, 0xC4, 0x89, 0x12, 0x25, 0x4B, 0x97, 0x2E, 0x5C, 0xB8, 0x70, 0xE0,
+    0xC0, 0x81, 0x03, 0x06, 0x0C, 0x19, 0x32, 0x64, 0xC9, 0x92, 0x24, 0x49, 0x93, 0x26, 0x4D, 0x9B,
+    0x37, 0x6E, 0xDC, 0xB9, 0x72, 0xE4, 0xC8, 0x90, 0x20, 0x41, 0x82, 0x05, 0x0A, 0x15, 0x2B, 0x56,
+    0xAD, 0x5B, 0xB6, 0x6D, 0xDA, 0xB5, 0x6B, 0xD6, 0xAC, 0x59, 0xB2, 0x65, 0xCB, 0x96, 0x2D, 0x5A,
+    0xB4, 0x69, 0xD2, 0xA4, 0x48, 0x91, 0x22, 0x45, 0x8A, 0x14, 0x29, 0x52, 0xA5, 0x4A, 0x95, 0x2A,
+    0x54, 0xA9, 0x53, 0xA7, 0x4E, 0x9D, 0x3B, 0x77, 0xEE, 0xDD, 0xBB, 0x76, 0xED, 0xDB, 0xB7, 0x6F,
+    0xDE, 0xBD, 0x7A, 0xF5, 0xEB, 0xD7, 0xAF, 0x5F, 0xBE, 0x7C, 0xF9, 0xF2, 0xE5, 0xCA, 0x94, 0x28,
+    0x50, 0xA1, 0x42, 0x84, 0x09, 0x13, 0x27, 0x4F, 0x9F, 0x3F, 0x7F
+};
 
 int encode_lora(uint16_t *symbols, const uint8_t *payload, int len, int sf, int rdd) {
-    uint8_t codewords[512]; memset(codewords, 0, sizeof(codewords));
-    memset(symbols, 0, 512 * sizeof(uint16_t));
-    uint8_t whitening[] = {0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00};
-    codewords[0] = encodeHamming84sx(0);
-    codewords[1] = encodeHamming84sx(len & 0xf);
-    codewords[2] = encodeHamming84sx(len >> 4);
-    codewords[3] = encodeHamming84sx(0x08); 
-    codewords[4] = encodeHamming84sx(0);    
+    uint8_t h[8]; memset(h, 0, 8);
+    h[0] = (len >> 4);
+    h[1] = (len & 0x0F);
+    h[2] = (4 << 1) | 0; // CR=4/8, No CRC
+    
+    bool c4 = (h[0] & 0x8) >> 3 ^ (h[0] & 0x4) >> 2 ^ (h[0] & 0x2) >> 1 ^ (h[0] & 0x1);
+    bool c3 = (h[0] & 0x8) >> 3 ^ (h[1] & 0x8) >> 3 ^ (h[1] & 0x4) >> 2 ^ (h[1] & 0x2) >> 1 ^ (h[2] & 0x1);
+    bool c2 = (h[0] & 0x4) >> 2 ^ (h[1] & 0x8) >> 3 ^ (h[1] & 0x1) ^ (h[2] & 0x8) >> 3 ^ (h[2] & 0x2) >> 1;
+    bool c1 = (h[0] & 0x2) >> 1 ^ (h[1] & 0x4) >> 2 ^ (h[1] & 0x1) ^ (h[2] & 0x4) >> 2 ^ (h[2] & 0x2) >> 1 ^ (h[2] & 0x1);
+    bool c0 = (h[0] & 0x1) ^ (h[1] & 0x2) >> 1 ^ (h[2] & 0x8) >> 3 ^ (h[2] & 0x4) >> 2 ^ (h[2] & 0x2) >> 1 ^ (h[2] & 0x1);
+    h[3] = c4; h[4] = (c3 << 3) | (c2 << 2) | (c1 << 1) | c0;
 
+    uint8_t codewords[512]; memset(codewords, 0, sizeof(codewords));
+    for (int i=0; i<8; i++) codewords[i] = encodeHamming84sx(h[i]);
+    
     for(int i=0; i<len; i++) {
-        uint8_t val = payload[i] ^ whitening[i % 16]; 
+        uint8_t val = payload[i] ^ whitening_seq[i]; 
         codewords[8 + i*2] = encodeHamming84sx(val & 0xf);
         codewords[8 + i*2 + 1] = encodeHamming84sx(val >> 4);
     }
-    diagonalInterleaveSx(codewords, 8, symbols, 8, 4);
-    int num_payload_codewords = len * 2;
-    diagonalInterleaveSx(codewords + 8, num_payload_codewords, symbols + 8, sf, 4);
-    for (int i = 0; i < 8 + (len*2); i++) {
-        symbols[i] = grayToBinary16(symbols[i]);
-        if (i < 8) symbols[i] <<= 2;
+    
+    // Header block (8 symbols)
+    for (int i=0; i<8; i++) {
+        uint16_t s = 0;
+        for (int j=0; j<8; j++) {
+            int cw_idx = (i - j - 1); while (cw_idx < 0) cw_idx += 8; cw_idx %= 8;
+            int bit = (codewords[cw_idx] >> i) & 0x1;
+            s |= (bit << j);
+        }
+        int parity = 0; for(int b=0; b<8; b++) if (s & (1<<b)) parity++;
+        s |= ((parity % 2) << 8);
+        symbols[i] = binaryToGray(s);
     }
-    return 8 + (len * 2);
+
+    // Payload block (8 symbols)
+    for (int i=0; i<8; i++) {
+        uint16_t s = 0;
+        for (int j=0; j<10; j++) {
+            int cw_idx = (i - j - 1); while (cw_idx < 0) cw_idx += 10; cw_idx %= 10;
+            int bit = (codewords[8 + cw_idx] >> i) & 0x1;
+            s |= (bit << j);
+        }
+        symbols[8 + i] = binaryToGray(s);
+    }
+    return 16;
 }
 
 void core1_entry() {
@@ -179,11 +202,10 @@ void core1_entry() {
 
     uint16_t symbols[512];
     uint8_t payload[] = "HELLO";
-    int payload_len = strlen((char*)payload);
-    int sym_count = encode_lora(symbols, payload, payload_len, 10, 4);
+    int sym_count = encode_lora(symbols, payload, 5, 10, 4);
     
     while (1) {
-        printf("TX 62.5MHz '%s'...", payload); fflush(stdout);
+        printf("TX 62.5MHz 'HELLO'..."); fflush(stdout);
         pio_sm_set_enabled(pio, sm, false);
         dma_channel_abort(chan0); dma_channel_abort(chan1);
         pio_sm_restart(pio, sm); pio_sm_clkdiv_restart(pio, sm);
@@ -191,8 +213,8 @@ void core1_entry() {
         pio_sm_set_enabled(pio, sm, true);
 
         for(int i=0; i<8; i++) play_symbol(up_chirp, 0, pio, sm);
-        play_symbol(up_chirp, 192, pio, sm);
-        play_symbol(up_chirp, 256, pio, sm);
+        play_symbol(up_chirp, 8, pio, sm);
+        play_symbol(up_chirp, 16, pio, sm);
         play_symbol(down_chirp, 0, pio, sm);
         play_symbol(down_chirp, 0, pio, sm);
         play_partial_symbol(down_chirp, 0, 16000, pio, sm); 
