@@ -207,7 +207,25 @@ void lora_tx_thread(void)
 static void lora_rx_cb(const struct device *dev, uint8_t *data, uint16_t len,  
 		       int16_t rssi, int8_t snr)  
 {  
-	LOG_INF("RX pkt, RSSI=%d", rssi);  
+	char ascii_buf[len + 1];
+
+	// Prepare ASCII representation, replacing non-printable chars with '.'
+	for (int i = 0; i < len; i++) {
+		if (data[i] >= 32 && data[i] <= 126) {
+			ascii_buf[i] = data[i];
+		} else {
+			ascii_buf[i] = '.';
+		}
+	}
+	ascii_buf[len] = '\0';
+
+	LOG_INF("RX packet received!");
+	LOG_INF("  Length: %u bytes", len);
+	LOG_INF("  RSSI:   %d dBm", rssi);
+	LOG_INF("  SNR:    %d dB", snr);
+	LOG_INF("  ASCII:  [%s]", ascii_buf);
+	LOG_HEXDUMP_INF(data, len, "  HEX:    ");
+
 	k_mutex_lock(&disp_mutex, K_NO_WAIT);  
 	g_stats.rx_cnt++;  
 	k_mutex_unlock(&disp_mutex);  
