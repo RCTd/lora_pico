@@ -42,7 +42,7 @@ class lora_rx_top_block(gr.top_block):
         
         # Connections
         self.connect(self.src, self.lora_rx)
-        self.msg_connect((self.lora_rx, "frames"), (self.debug, "print"))
+        #self.msg_connect((self.lora_rx, "frames"), (self.debug, "print"))
         self.msg_connect((self.lora_rx, "frames"), (self.snk, "in"))
 
 def main():

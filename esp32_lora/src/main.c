@@ -181,7 +181,8 @@ void lora_tx_thread(void)
 
         uint32_t uptime = k_uptime_get_32();
 		sys_put_le32(g_stats.tx_cnt, &frame[0]);  
-		sys_put_le32(uptime, &frame[4]);  
+//		sys_put_le32(uptime, &frame[4]);  
+//		sys_put_le32(0, &frame[0]);  
 
         LOG_INF("Send");  
 
@@ -217,15 +218,23 @@ static void lora_rx_cb(const struct device *dev, uint8_t *data, uint16_t len,
 void display_thread(void)  
 {  
 	display_dev = DEVICE_DT_GET(DISPLAY_NODE);  
-	cfb_framebuffer_init(display_dev);  
+	if (!device_is_ready(display_dev)) {
+		LOG_ERR("Display device not ready");
+		return;
+	}
+
+	if (cfb_framebuffer_init(display_dev)) {
+		LOG_ERR("Framebuffer initialization failed");
+		return;
+	}
   
 	char buf[32];  
   
 	for (;;) {  
-		k_sleep(K_MSEC(100));  
+		k_sleep(K_MSEC(500));  
   
 		k_mutex_lock(&disp_mutex, K_FOREVER);  
-		cfb_framebuffer_clear(display_dev, true);  
+		cfb_framebuffer_clear(display_dev, false);  
   
 		snprintk(buf, sizeof(buf), "TX:%u RX:%u",  
 			 g_stats.tx_cnt, g_stats.rx_cnt);  

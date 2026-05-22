@@ -1,0 +1,16 @@
+ The Working Commands:
+
+  1. Environment Setup:
+
+   1 cd /nas/Pico/pico/pico-examples/zephyrproject
+   2 source .venv/bin/activate
+   3 export ZEPHYR_SDK_INSTALL_DIR=/nas/Pico/pico/pico-examples/zephyr-sdk-0.16.8
+
+  2. Build (omitting BOARD_ROOT):
+
+   1 west build -b ttgo_t_beam/esp32/procpu -p always /nas/Pico/pico/pico-examples/lora_pico/esp32_lora
+
+  3. Flash:
+
+   1 west flash --esp-device /dev/ttyACM1 --esp-baud-rate 115200
+
