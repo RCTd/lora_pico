@@ -25,36 +25,15 @@ const double f_sample = 62500000.0; // 62.5 MHz
 const double T_chirp  = 0.008192; 
 
 #define CHIRP_SIZE 64000
-uint8_t up_chirp[CHIRP_SIZE];
-uint8_t down_chirp[CHIRP_SIZE];
+#include "chirp_tables.h"
 
-void init_tables() {
-    printf("Generating 62.5MHz single-chirps...\n");
-    for (int i = 0; i < CHIRP_SIZE; i++) {
-        uint8_t byte_up = 0;
-        uint8_t byte_down = 0;
-        for (int b = 0; b < 8; b++) {
-            int t_idx = i * 8 + b;
-            double t = (double)t_idx / f_sample;
-            double phase_up = f_low * t + (bandwidth / (2.0 * T_chirp)) * t * t;
-            double phase_down = f_high * t - (bandwidth / (2.0 * T_chirp)) * t * t;
-            phase_up = phase_up - floor(phase_up);
-            phase_down = phase_down - floor(phase_down);
-            uint8_t bit_up = (phase_up >= 0.5) ? 1 : 0;
-            uint8_t bit_down = (phase_down >= 0.5) ? 1 : 0;
-            byte_up = (byte_up >> 1) | (bit_up << 7);
-            byte_down = (byte_down >> 1) | (bit_down << 7);
-        }
-        up_chirp[i] = byte_up;
-        down_chirp[i] = byte_down;
-    }
-    printf("62.5MHz Tables ready.\n");
-}
+uint8_t up_chirp_ram[CHIRP_SIZE];
+uint8_t down_chirp_ram[CHIRP_SIZE];
 
 int chan0, chan1;
 dma_channel_config c0, c1;
 
-void play_symbol(uint8_t *chirp_buf, uint16_t symbol_shift, PIO pio, uint sm) {
+void play_symbol(const uint8_t *chirp_buf, uint16_t symbol_shift, PIO pio, uint sm) {
     uint32_t byte_offset = (uint32_t)(symbol_shift * 62.5); 
     uint32_t first_part_len = CHIRP_SIZE - byte_offset;
     uint32_t second_part_len = byte_offset;
@@ -74,13 +53,13 @@ void play_symbol(uint8_t *chirp_buf, uint16_t symbol_shift, PIO pio, uint sm) {
     }
 }
 
-void play_partial_symbol(uint8_t *chirp_buf, uint16_t symbol_shift, int num_bytes, PIO pio, uint sm) {
+void play_partial_symbol(const uint8_t *chirp_buf, uint16_t symbol_shift, int num_bytes, PIO pio, uint sm) {
     uint32_t byte_offset = (uint32_t)(symbol_shift * 62.5);
     uint32_t bytes_left_in_buf = CHIRP_SIZE - byte_offset;
     dma_channel_wait_for_finish_blocking(chan0);
     dma_channel_wait_for_finish_blocking(chan1);
 
-    if (num_bytes <= bytes_left_in_buf) {
+    if (num_bytes <= (int)bytes_left_in_buf) {
         dma_channel_set_trans_count(chan1, 0, false);
         dma_channel_set_read_addr(chan0, chirp_buf + byte_offset, false);
         dma_channel_set_trans_count(chan0, num_bytes, true);
@@ -96,7 +75,12 @@ void play_partial_symbol(uint8_t *chirp_buf, uint16_t symbol_shift, int num_byte
 
 void core1_entry() {
     printf("Core 1: 62.5MHz Engine Running\n");
-    init_tables();
+    
+    // Fast copy from Flash to RAM
+    memcpy(up_chirp_ram, up_chirp, CHIRP_SIZE);
+    memcpy(down_chirp_ram, down_chirp, CHIRP_SIZE);
+    printf("Chirps copied to RAM.\n");
+
     PIO pio = pio0;
     uint offset = pio_add_program(pio, &lora_out_program);
     uint sm = pio_claim_unused_sm(pio, true);
@@ -155,21 +139,20 @@ void core1_entry() {
         pio_sm_set_enabled(pio, sm, true);
         
         // 1. Preamble: 10 up-chirps
-        for(int i=0; i<10; i++) play_symbol(up_chirp, 0, pio, sm);
+        for(int i=0; i<10; i++) play_symbol(up_chirp_ram, 0, pio, sm);
         
         // 2. Network Sync: 2 up-chirps (Standard value 0x12)
-        // For SF10, sync word is typically shifted. In many implementations, it's just 2 up-chirps with offset.
-        // We'll use 0x12 as a common sync word value.
-        play_symbol(up_chirp, 0x12, pio, sm);
-        play_symbol(up_chirp, 0x12, pio, sm);
+        // For SF10, 0x12 nibbles are 1 and 2, shifted by 3.
+        play_symbol(up_chirp_ram, 8, pio, sm);
+        play_symbol(up_chirp_ram, 16, pio, sm);
 
         // 3. Sync Frame: 2.25 down-chirps
-        play_symbol(down_chirp, 0, pio, sm);
-        play_symbol(down_chirp, 0, pio, sm);
-        play_partial_symbol(down_chirp, 0, CHIRP_SIZE / 4, pio, sm);
+        play_symbol(down_chirp_ram, 0, pio, sm);
+        play_symbol(down_chirp_ram, 0, pio, sm);
+        play_partial_symbol(down_chirp_ram, 0, CHIRP_SIZE / 4, pio, sm);
         
         // 4. Data Symbols (Header + Payload combined by CreateMessageFromPayload)
-        for(int i=0; i<sym_count; i++) play_symbol(up_chirp, symbols[i], pio, sm);
+        for(int i=0; i<sym_count; i++) play_symbol(up_chirp_ram, symbols[i], pio, sm);
         
         dma_channel_wait_for_finish_blocking(chan0);
         dma_channel_wait_for_finish_blocking(chan1);
