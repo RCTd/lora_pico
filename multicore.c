@@ -118,20 +118,27 @@ void core1_entry() {
     uint16_t symbols[MAX_SYMBOLS];
     int sym_count = 0;
     
-    // Payload buffer needs space for CRC (2 bytes) and extra overhead.
-    uint8_t payload_buf[64]; 
-    memset(payload_buf, 0, sizeof(payload_buf));
-    memcpy(payload_buf, "HELLO", 5);
-    int payload_len = 5;
+    const char *payloads[] = {"Hello", "World", "Rebeca"};
+    const int num_payloads = 3;
+    int payload_idx = 0;
 
-    int r = CreateMessageFromPayload(symbols, &sym_count, MAX_SYMBOLS, sf, rdd, payload_buf, payload_len);
-    if (r < 0) {
-        printf("Error encoding LoRa message\n");
-        return;
-    }
-    
     while (1) {
-        printf("TX 62.5MHz Standards-Compliant LoRa Packet..."); fflush(stdout);
+        const char *current_payload = payloads[payload_idx];
+        int payload_len = strlen(current_payload);
+        
+        // Payload buffer needs space for CRC (2 bytes) and extra overhead.
+        uint8_t payload_buf[64]; 
+        memset(payload_buf, 0, sizeof(payload_buf));
+        memcpy(payload_buf, current_payload, payload_len);
+
+        int r = CreateMessageFromPayload(symbols, &sym_count, MAX_SYMBOLS, sf, rdd, payload_buf, payload_len);
+        if (r < 0) {
+            printf("Error encoding LoRa message for %s\n", current_payload);
+            payload_idx = (payload_idx + 1) % num_payloads;
+            continue;
+        }
+
+        printf("TX 62.5MHz Standards-Compliant LoRa Packet [%s]...", current_payload); fflush(stdout);
         pio_sm_set_enabled(pio, sm, false);
         dma_channel_abort(chan0); dma_channel_abort(chan1);
         pio_sm_restart(pio, sm); pio_sm_clkdiv_restart(pio, sm);
@@ -156,11 +163,10 @@ void core1_entry() {
         
         dma_channel_wait_for_finish_blocking(chan0);
         dma_channel_wait_for_finish_blocking(chan1);
-        sleep_us(100);
         printf(" Done\n");
         pio_sm_set_enabled(pio, sm, false);
         gpio_put(OUTPUT_PIN, 0); 
-        sleep_ms(3000);
+        payload_idx = (payload_idx + 1) % num_payloads;
     }
 }
 
