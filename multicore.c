@@ -24,7 +24,6 @@ const double f_high   = f_center + bandwidth/2.0;
 const double f_sample = 62500000.0; // 62.5 MHz
 const double T_chirp  = 0.008192; 
 
-#define CHIRP_SIZE 64000
 #include "chirp_tables.h"
 
 uint8_t up_chirp_ram[CHIRP_SIZE];
@@ -34,7 +33,7 @@ int chan0, chan1;
 dma_channel_config c0, c1;
 
 void play_symbol(const uint8_t *chirp_buf, uint16_t symbol_shift, PIO pio, uint sm) {
-    uint32_t byte_offset = (uint32_t)(symbol_shift * 62.5); 
+    uint32_t byte_offset = (uint32_t)(symbol_shift * BYTE_OFFSET_PER_SYMBOL); 
     uint32_t first_part_len = CHIRP_SIZE - byte_offset;
     uint32_t second_part_len = byte_offset;
 
@@ -54,7 +53,7 @@ void play_symbol(const uint8_t *chirp_buf, uint16_t symbol_shift, PIO pio, uint 
 }
 
 void play_partial_symbol(const uint8_t *chirp_buf, uint16_t symbol_shift, int num_bytes, PIO pio, uint sm) {
-    uint32_t byte_offset = (uint32_t)(symbol_shift * 62.5);
+    uint32_t byte_offset = (uint32_t)(symbol_shift * BYTE_OFFSET_PER_SYMBOL);
     uint32_t bytes_left_in_buf = CHIRP_SIZE - byte_offset;
     dma_channel_wait_for_finish_blocking(chan0);
     dma_channel_wait_for_finish_blocking(chan1);
@@ -112,7 +111,7 @@ void core1_entry() {
     sm_config_set_clkdiv(&sm_c, 2.0f); 
     pio_sm_init(pio, sm, offset, &sm_c);
 
-    int sf = 10;
+    int sf = LORA_SF;
     int rdd = 4;
     #define MAX_SYMBOLS 512
     uint16_t symbols[MAX_SYMBOLS];
