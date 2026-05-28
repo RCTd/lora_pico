@@ -1,4 +1,4 @@
-identifier: ttgo_t_beam/esp32/procpu
+identifier: ttgo_t_beam_v1/esp32/procpu
 name: TTGO T-Beam PROCPU
 type: mcu
 arch: xtensa

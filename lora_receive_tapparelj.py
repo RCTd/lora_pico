@@ -16,7 +16,7 @@ class lora_rx_top_block(gr.top_block):
         self.src = osmosdr.source(args="rtl=0")
         self.src.set_sample_rate(samp_rate)
         self.src.set_center_freq(freq, 0)
-        self.src.set_gain(40, 0)
+        self.src.set_gain(49, 0)
         
         # Buffer size optimization for RTL-SDR
         self.src.set_min_output_buffer(int(np.ceil(samp_rate/bw*(2**sf+2))))
@@ -32,7 +32,7 @@ class lora_rx_top_block(gr.top_block):
             pay_len=255,
             samp_rate=int(samp_rate),
             sf=sf,
-            sync_word=[0x12], # Matches the Pico W's sync word
+            sync_word=[16, 8], # Matches the updated Pico W's sync word
             soft_decoding=False,
             ldro_mode=2,
             print_rx=[True, True] # Prints headers and payload to console
@@ -48,7 +48,7 @@ class lora_rx_top_block(gr.top_block):
 def main():
     parser = argparse.ArgumentParser(description="LoRa Receiver with RTL-SDR (tapparelj)")
     parser.add_argument("--freq", type=float, default=865.1e6, help="Frequency in Hz (default: 865.1e6)")
-    parser.add_argument("--samp-rate", type=float, default=1e6, help="Sample rate in Hz (default: 1e6)")
+    parser.add_argument("--samp-rate", type=float, default=2e6, help="Sample rate in Hz (default: 2e6)")
     parser.add_argument("--sf", type=int, default=10, help="Spreading Factor 7-12 (default: 10)")
     parser.add_argument("--bw", type=float, default=125000, help="Bandwidth in Hz (default: 125000)")
     args = parser.parse_args()

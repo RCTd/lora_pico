@@ -1,5 +1,5 @@
 board:
-  name: ttgo_t_beam
+  name: ttgo_t_beam_v1
   vendor: lilygo
   socs:
   - name: esp32

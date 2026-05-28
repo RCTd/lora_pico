@@ -6,7 +6,7 @@
 /dts-v1/;
 
 #include <espressif/esp32/esp32_pico_d4.dtsi>
-#include "ttgo_t_beam-pinctrl.dtsi"
+#include "ttgo_t_beam_v1-pinctrl.dtsi"
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 #include <espressif/partitions_0x1000_amp.dtsi>
 

@@ -4,6 +4,25 @@
     out pins, 1
 .wrap
 
+.program lora_rle
+.side_set 1
+
+; Run-Length Encoded LoRa Generator
+; Each bit from CPU: 0 = 3 samples (6 cycles), 1 = 4 samples (8 cycles)
+; Pin toggles after every bit.
+; PIO Clock must be 125MHz.
+
+.wrap_target
+bit0:
+    out x, 1       side 0 [4] ; Cycles 1-5.
+    jmp !x bit1    side 0     ; Cycle 6.
+    nop            side 0 [1] ; Cycles 7-8.
+bit1:
+    out x, 1       side 1 [4] ; Cycles 1-5.
+    jmp !x bit0    side 1     ; Cycle 6.
+    nop            side 1 [1] ; Cycles 7-8.
+.wrap
+
 % c-sdk {
 static inline void lora_out_program_init(PIO pio, uint sm, uint offset, uint pin, float div) {
     pio_gpio_init(pio, pin);
@@ -16,6 +35,25 @@ static inline void lora_out_program_init(PIO pio, uint sm, uint offset, uint pin
     // Shift to right, autopull enabled, threshold 32
     sm_config_set_out_shift(&c, true, true, 32);
     sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void lora_rle_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+
+    pio_sm_config c = lora_rle_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    // Shift to right, autopull enabled, threshold 32
+    sm_config_set_out_shift(&c, true, true, 32);
+    
+    // RLE runs at full 125MHz to achieve 2-cycle precision for 62.5Msps equivalency
+    sm_config_set_clkdiv(&c, 1.0f);
 
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
