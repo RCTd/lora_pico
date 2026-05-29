@@ -16,14 +16,14 @@
 
 #define OUTPUT_PIN 1
 
-bi_decl(bi_program_description("Perfect 64MHz Aligned Zero-Gap SDR Architecture"));
+bi_decl(bi_program_description("25MHz Zero-Jitter RAM-Backed LoRa SDR Architecture"));
 bi_decl(bi_1pin_with_name(OUTPUT_PIN, "RF Output"));
 
 #include "chirp_tables.h"
 
-// Dedicated RAM Buffers for zero-jitter high-power output
-uint8_t up_chirp_ram[CHIRP_SIZE] __attribute__((aligned(65536)));
-uint8_t down_chirp_ram[CHIRP_SIZE] __attribute__((aligned(65536)));
+// Dedicated RAM Buffers (50KB Total)
+uint8_t up_chirp_ram[CHIRP_SIZE] __attribute__((aligned(4)));
+uint8_t down_chirp_ram[CHIRP_SIZE] __attribute__((aligned(4)));
 
 // DMA Resources
 int chan0, chan1;
@@ -32,14 +32,14 @@ dma_channel_config c0, c1;
 // DMA Block Queue
 struct dma_block {
     const uint8_t *addr;
-    uint32_t count_words;
+    uint32_t count_bytes;
 };
 struct dma_block packet_blocks[2048];
 volatile int num_blocks = 0;
 volatile int next_block_to_queue = 0;
 volatile bool packet_done = false;
 
-// Helper to pre-calculate perfectly aligned 32-bit DMA transfers
+// Helper to pre-calculate DMA transfers
 void queue_symbol(const uint8_t *chirp_buf, uint16_t symbol_shift, uint32_t total_len_bytes) {
     uint32_t byte_offset = (uint32_t)(symbol_shift * BYTE_OFFSET_PER_SYMBOL);
     uint32_t first_part_len = CHIRP_SIZE - byte_offset;
@@ -48,16 +48,16 @@ void queue_symbol(const uint8_t *chirp_buf, uint16_t symbol_shift, uint32_t tota
 
     if (total_len_bytes <= first_part_len) {
         packet_blocks[num_blocks].addr = chirp_buf + byte_offset;
-        packet_blocks[num_blocks].count_words = total_len_bytes / 4;
+        packet_blocks[num_blocks].count_bytes = total_len_bytes;
         num_blocks++;
     } else {
         uint32_t second_part_len = total_len_bytes - first_part_len;
         packet_blocks[num_blocks].addr = chirp_buf + byte_offset;
-        packet_blocks[num_blocks].count_words = first_part_len / 4;
+        packet_blocks[num_blocks].count_bytes = first_part_len;
         num_blocks++;
         
         packet_blocks[num_blocks].addr = chirp_buf;
-        packet_blocks[num_blocks].count_words = second_part_len / 4;
+        packet_blocks[num_blocks].count_bytes = second_part_len;
         num_blocks++;
     }
 }
@@ -75,7 +75,7 @@ void dma_handler() {
     if (finished_chan != -1) {
         if (next_block_to_queue < num_blocks) {
             dma_channel_set_read_addr(finished_chan, packet_blocks[next_block_to_queue].addr, false);
-            dma_channel_set_trans_count(finished_chan, packet_blocks[next_block_to_queue].count_words, false);
+            dma_channel_set_trans_count(finished_chan, packet_blocks[next_block_to_queue].count_bytes, false);
             next_block_to_queue++;
         } else {
             int other_chan = (finished_chan == chan0) ? chan1 : chan0;
@@ -89,12 +89,11 @@ void dma_handler() {
 
 void core1_entry() {
     sleep_ms(3000);
-    printf("Core 1: Perfect 64MHz Aligned Engine Started\n");
+    printf("Core 1: 25MHz RAM-Backed Engine Started (Zero-Jitter, Aligned)\n");
 
-    // Copy to internal SRAM for maximum performance
     memcpy(up_chirp_ram, up_chirp, CHIRP_SIZE);
     memcpy(down_chirp_ram, down_chirp, CHIRP_SIZE);
-    printf("Chirps Ready in SRAM.\n");
+    printf("Chirps ready in RAM (50KB used).\n");
     
     PIO pio = pio0;
     uint offset = pio_add_program(pio, &lora_out_program);
@@ -103,7 +102,7 @@ void core1_entry() {
     pio_sm_config sm_c = lora_out_program_get_default_config(offset);
     sm_config_set_out_pins(&sm_c, OUTPUT_PIN, 1);
     sm_config_set_fifo_join(&sm_c, PIO_FIFO_JOIN_TX);
-    sm_config_set_out_shift(&sm_c, true, true, 32);
+    sm_config_set_out_shift(&sm_c, true, true, 8); 
     sm_config_set_clkdiv(&sm_c, PIO_DIVIDER); 
     pio_gpio_init(pio, OUTPUT_PIN);
     pio_sm_set_consecutive_pindirs(pio, sm, OUTPUT_PIN, 1, true);
@@ -113,12 +112,12 @@ void core1_entry() {
     chan1 = dma_claim_unused_channel(true);
     
     c0 = dma_channel_get_default_config(chan0);
-    channel_config_set_transfer_data_size(&c0, DMA_SIZE_32);
+    channel_config_set_transfer_data_size(&c0, DMA_SIZE_8);
     channel_config_set_read_increment(&c0, true);
     channel_config_set_dreq(&c0, pio_get_dreq(pio, sm, true));
 
     c1 = dma_channel_get_default_config(chan1);
-    channel_config_set_transfer_data_size(&c1, DMA_SIZE_32);
+    channel_config_set_transfer_data_size(&c1, DMA_SIZE_8);
     channel_config_set_read_increment(&c1, true);
     channel_config_set_dreq(&c1, pio_get_dreq(pio, sm, true));
 
@@ -155,10 +154,10 @@ void core1_entry() {
             next_block_to_queue = 2;
 
             channel_config_set_chain_to(&c0, chan1);
-            dma_channel_configure(chan0, &c0, &pio->txf[sm], packet_blocks[0].addr, packet_blocks[0].count_words, false);
+            dma_channel_configure(chan0, &c0, &pio->txf[sm], packet_blocks[0].addr, packet_blocks[0].count_bytes, false);
             
             channel_config_set_chain_to(&c1, chan0);
-            dma_channel_configure(chan1, &c1, &pio->txf[sm], packet_blocks[1].addr, packet_blocks[1].count_words, false);
+            dma_channel_configure(chan1, &c1, &pio->txf[sm], packet_blocks[1].addr, packet_blocks[1].count_bytes, false);
 
             pio_sm_set_enabled(pio, sm, true);
             dma_channel_start(chan0);
@@ -176,7 +175,6 @@ void core1_entry() {
             payload_idx = (payload_idx + 1) % 3;
             sleep_ms(1000);
         }
-        
         printf("Maintenance Window...\n");
         watchdog_update();
         sleep_ms(5000);
@@ -188,7 +186,7 @@ int main() {
     set_sys_clock_khz(125000, true);
     stdio_init_all();
     watchdog_enable(8000, 1);
-    printf("Pico W: No-Touch LoRa Engine Starting...\n");
+    printf("Pico W: No-Touch 125MHz Starting...\n");
     multicore_launch_core1(core1_entry);
     while (1) tight_loop_contents();
 }

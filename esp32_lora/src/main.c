@@ -33,7 +33,7 @@ struct event_t {
 };  
   
 static struct lora_modem_config cfg_tx = {  
-        .frequency      = 865100000,  
+        .frequency      = 864920000,  
         .bandwidth      = BW_125_KHZ,  
         .datarate       = SF_10,  
         .preamble_len   = 12,  
@@ -45,7 +45,7 @@ static struct lora_modem_config cfg_tx = {
 };  
   
 static struct lora_modem_config cfg_rx = {  
-        .frequency      = 865100000,  
+        .frequency      = 864920000,  
         .bandwidth      = BW_125_KHZ,  
         .datarate       = SF_10,  
         .preamble_len   = 12,  
