@@ -7,6 +7,7 @@
 #include "hardware/dma.h"
 #include "hardware/clocks.h"
 #include "hardware/watchdog.h"
+#include "hardware/irq.h"
 #include "blink.pio.h"
 
 #include "pico/binary_info.h"
@@ -15,40 +16,85 @@
 
 #define OUTPUT_PIN 1
 
-bi_decl(bi_program_description("Gapless 64MHz LoRa SDR with No-Touch Safety Architecture"));
+bi_decl(bi_program_description("Perfect 64MHz Aligned Zero-Gap SDR Architecture"));
 bi_decl(bi_1pin_with_name(OUTPUT_PIN, "RF Output"));
 
 #include "chirp_tables.h"
 
+// Dedicated RAM Buffers for zero-jitter high-power output
+uint8_t up_chirp_ram[CHIRP_SIZE] __attribute__((aligned(65536)));
+uint8_t down_chirp_ram[CHIRP_SIZE] __attribute__((aligned(65536)));
+
+// DMA Resources
 int chan0, chan1;
 dma_channel_config c0, c1;
 
-void play_symbol_gapless(const uint8_t *chirp_buf, uint16_t symbol_shift, uint32_t total_len, PIO pio, uint sm) {
-    uint32_t byte_offset = (uint32_t)(symbol_shift * BYTE_OFFSET_PER_SYMBOL); 
-    uint32_t first_part_len = CHIRP_SIZE - byte_offset;
-    uint32_t second_part_len = (total_len > first_part_len) ? (total_len - first_part_len) : 0;
-    
-    dma_channel_wait_for_finish_blocking(chan0);
-    dma_channel_wait_for_finish_blocking(chan1);
-    
-    // Feed watchdog after every symbol (every 32ms at SF12)
-    watchdog_update();
+// DMA Block Queue
+struct dma_block {
+    const uint8_t *addr;
+    uint32_t count_words;
+};
+struct dma_block packet_blocks[2048];
+volatile int num_blocks = 0;
+volatile int next_block_to_queue = 0;
+volatile bool packet_done = false;
 
-    if (second_part_len == 0) {
-        dma_channel_set_read_addr(chan0, chirp_buf + byte_offset, false);
-        dma_channel_set_trans_count(chan0, total_len / 4, true);
+// Helper to pre-calculate perfectly aligned 32-bit DMA transfers
+void queue_symbol(const uint8_t *chirp_buf, uint16_t symbol_shift, uint32_t total_len_bytes) {
+    uint32_t byte_offset = (uint32_t)(symbol_shift * BYTE_OFFSET_PER_SYMBOL);
+    uint32_t first_part_len = CHIRP_SIZE - byte_offset;
+    
+    if (total_len_bytes > CHIRP_SIZE) total_len_bytes = CHIRP_SIZE;
+
+    if (total_len_bytes <= first_part_len) {
+        packet_blocks[num_blocks].addr = chirp_buf + byte_offset;
+        packet_blocks[num_blocks].count_words = total_len_bytes / 4;
+        num_blocks++;
     } else {
-        dma_channel_set_read_addr(chan1, chirp_buf, false);
-        dma_channel_set_trans_count(chan1, second_part_len / 4, false);
-        dma_channel_set_read_addr(chan0, chirp_buf + byte_offset, false);
-        dma_channel_set_trans_count(chan0, first_part_len / 4, true);
+        uint32_t second_part_len = total_len_bytes - first_part_len;
+        packet_blocks[num_blocks].addr = chirp_buf + byte_offset;
+        packet_blocks[num_blocks].count_words = first_part_len / 4;
+        num_blocks++;
+        
+        packet_blocks[num_blocks].addr = chirp_buf;
+        packet_blocks[num_blocks].count_words = second_part_len / 4;
+        num_blocks++;
+    }
+}
+
+void dma_handler() {
+    int finished_chan = -1;
+    if (dma_channel_get_irq0_status(chan0)) {
+        dma_channel_acknowledge_irq0(chan0);
+        finished_chan = chan0;
+    } else if (dma_channel_get_irq0_status(chan1)) {
+        dma_channel_acknowledge_irq0(chan1);
+        finished_chan = chan1;
+    }
+
+    if (finished_chan != -1) {
+        if (next_block_to_queue < num_blocks) {
+            dma_channel_set_read_addr(finished_chan, packet_blocks[next_block_to_queue].addr, false);
+            dma_channel_set_trans_count(finished_chan, packet_blocks[next_block_to_queue].count_words, false);
+            next_block_to_queue++;
+        } else {
+            int other_chan = (finished_chan == chan0) ? chan1 : chan0;
+            dma_channel_config other_c = (finished_chan == chan0) ? c1 : c0;
+            channel_config_set_chain_to(&other_c, other_chan);
+            dma_channel_set_config(other_chan, &other_c, false);
+            if (!dma_channel_is_busy(other_chan)) packet_done = true;
+        }
     }
 }
 
 void core1_entry() {
-    // 1. SAFETY: Boot delay to allow picotool to catch the device
     sleep_ms(3000);
-    printf("Core 1: Safe-Burst 64MHz Engine Started\n");
+    printf("Core 1: Perfect 64MHz Aligned Engine Started\n");
+
+    // Copy to internal SRAM for maximum performance
+    memcpy(up_chirp_ram, up_chirp, CHIRP_SIZE);
+    memcpy(down_chirp_ram, down_chirp, CHIRP_SIZE);
+    printf("Chirps Ready in SRAM.\n");
     
     PIO pio = pio0;
     uint offset = pio_add_program(pio, &lora_out_program);
@@ -70,15 +116,16 @@ void core1_entry() {
     channel_config_set_transfer_data_size(&c0, DMA_SIZE_32);
     channel_config_set_read_increment(&c0, true);
     channel_config_set_dreq(&c0, pio_get_dreq(pio, sm, true));
-    channel_config_set_chain_to(&c0, chan1); 
 
     c1 = dma_channel_get_default_config(chan1);
     channel_config_set_transfer_data_size(&c1, DMA_SIZE_32);
     channel_config_set_read_increment(&c1, true);
     channel_config_set_dreq(&c1, pio_get_dreq(pio, sm, true));
 
-    dma_channel_configure(chan0, &c0, &pio->txf[sm], NULL, 0, false);
-    dma_channel_configure(chan1, &c1, &pio->txf[sm], NULL, 0, false);
+    dma_channel_set_irq0_enabled(chan0, true);
+    dma_channel_set_irq0_enabled(chan1, true);
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);
+    irq_set_enabled(DMA_IRQ_0, true);
 
     uint16_t symbols[1024];
     int sym_count = 0;
@@ -86,64 +133,61 @@ void core1_entry() {
     int payload_idx = 0;
 
     while (1) {
-        // BURST: Send 3 packets
         for (int b = 0; b < 3; b++) {
             const char *current_payload = payloads[payload_idx];
             uint8_t payload_buf[64]; memset(payload_buf, 0, sizeof(payload_buf));
             memcpy(payload_buf, current_payload, strlen(current_payload));
 
-            CreateMessageFromPayload(symbols, &sym_count, 1024, LORA_SF, 1, payload_buf, strlen(current_payload));
+            CreateMessageFromPayload(symbols, &sym_count, 1024, LORA_SF, 4, payload_buf, strlen(current_payload));
             
-            printf("TX BURST %d/3 [%s]...", b+1, current_payload); fflush(stdout);
+            printf("TX [%s] SF%d...", current_payload, LORA_SF); fflush(stdout);
+            
+            num_blocks = 0;
+            for (int i = 0; i < 12; i++) queue_symbol(up_chirp_ram, 0, CHIRP_SIZE);
+            queue_symbol(up_chirp_ram, 8, CHIRP_SIZE);
+            queue_symbol(up_chirp_ram, 16, CHIRP_SIZE);
+            queue_symbol(down_chirp_ram, 0, CHIRP_SIZE);
+            queue_symbol(down_chirp_ram, 0, CHIRP_SIZE);
+            queue_symbol(down_chirp_ram, 0, CHIRP_SIZE / 4);
+            for (int i = 0; i < sym_count; i++) queue_symbol(up_chirp_ram, symbols[i], CHIRP_SIZE);
+
+            packet_done = false;
+            next_block_to_queue = 2;
+
+            channel_config_set_chain_to(&c0, chan1);
+            dma_channel_configure(chan0, &c0, &pio->txf[sm], packet_blocks[0].addr, packet_blocks[0].count_words, false);
+            
+            channel_config_set_chain_to(&c1, chan0);
+            dma_channel_configure(chan1, &c1, &pio->txf[sm], packet_blocks[1].addr, packet_blocks[1].count_words, false);
+
             pio_sm_set_enabled(pio, sm, true);
+            dma_channel_start(chan0);
             
-            // Physical Frame
-            for(int i=0; i<12; i++) play_symbol_gapless(up_chirp, 0, CHIRP_SIZE, pio, sm);
-            
-            // Sync Word (8, 16)
-            play_symbol_gapless(up_chirp, 8, CHIRP_SIZE, pio, sm);
-            play_symbol_gapless(up_chirp, 16, CHIRP_SIZE, pio, sm);
-            
-            // Down-chirps (2.25)
-            play_symbol_gapless(down_chirp, 0, CHIRP_SIZE, pio, sm);
-            play_symbol_gapless(down_chirp, 0, CHIRP_SIZE, pio, sm);
-            play_symbol_gapless(down_chirp, 0, CHIRP_SIZE / 4, pio, sm);
-            
-            // Data
-            for(int i=0; i<sym_count; i++) play_symbol_gapless(up_chirp, symbols[i], CHIRP_SIZE, pio, sm);
-            
-            dma_channel_wait_for_finish_blocking(chan0);
-            dma_channel_wait_for_finish_blocking(chan1);
-            printf(" Done\n");
+            while (next_block_to_queue < num_blocks || dma_channel_is_busy(chan0) || dma_channel_is_busy(chan1)) {
+                tight_loop_contents();
+                watchdog_update();
+                if (packet_done) break; 
+            }
             
             pio_sm_set_enabled(pio, sm, false);
-            gpio_put(OUTPUT_PIN, 0); 
+            gpio_put(OUTPUT_PIN, 0);
+            printf(" OK\n");
+            
             payload_idx = (payload_idx + 1) % 3;
-            watchdog_update();
             sleep_ms(1000);
         }
-
-        // 2. MAINTENANCE WINDOW: Idle for 5 seconds to free up USB/System Bus
-        printf("Maintenance Window (USB Safe)... feeding watchdog.\n");
+        
+        printf("Maintenance Window...\n");
         watchdog_update();
-        pio_sm_set_enabled(pio, sm, false);
-        dma_channel_abort(chan0);
-        dma_channel_abort(chan1);
-        gpio_put(OUTPUT_PIN, 0); 
         sleep_ms(5000);
     }
 }
 
 int main() {
-    // BOOT-TIME RESCUE WINDOW (Always available)
     sleep_ms(3000);
-    
     set_sys_clock_khz(125000, true);
     stdio_init_all();
-    
-    // Enable Hardware Watchdog (8 seconds timeout)
     watchdog_enable(8000, 1);
-    
     printf("Pico W: No-Touch LoRa Engine Starting...\n");
     multicore_launch_core1(core1_entry);
     while (1) tight_loop_contents();
