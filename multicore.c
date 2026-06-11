@@ -12,11 +12,13 @@
 
 #include "pico/binary_info.h"
 
+#define LORAWAN 1
 #include "../lolra/lib/LoRa-SDR-Code.h"
+#include "../lolra/lib/lorawan_simple.h"
 
 #define OUTPUT_PIN 1
 
-bi_decl(bi_program_description("25MHz Zero-Jitter RAM-Backed LoRa SDR Architecture"));
+bi_decl(bi_program_description("25MHz Zero-Jitter RAM-Backed LoRaWAN Architecture"));
 bi_decl(bi_1pin_with_name(OUTPUT_PIN, "RF Output"));
 
 #include "chirp_tables.h"
@@ -39,7 +41,6 @@ volatile int num_blocks = 0;
 volatile int next_block_to_queue = 0;
 volatile bool packet_done = false;
 
-// Helper to pre-calculate DMA transfers
 void queue_symbol(const uint8_t *chirp_buf, uint16_t symbol_shift, uint32_t total_len_bytes) {
     uint32_t byte_offset = (uint32_t)(symbol_shift * BYTE_OFFSET_PER_SYMBOL);
     uint32_t first_part_len = CHIRP_SIZE - byte_offset;
@@ -89,11 +90,10 @@ void dma_handler() {
 
 void core1_entry() {
     sleep_ms(3000);
-    printf("Core 1: 25MHz RAM-Backed Engine Started (Zero-Jitter, Aligned)\n");
+    printf("Core 1: 25MHz RAM-Backed Engine Started (LoRaWAN)\n");
 
     memcpy(up_chirp_ram, up_chirp, CHIRP_SIZE);
     memcpy(down_chirp_ram, down_chirp, CHIRP_SIZE);
-    printf("Chirps ready in RAM (50KB used).\n");
     
     PIO pio = pio0;
     uint offset = pio_add_program(pio, &lora_out_program);
@@ -130,21 +130,34 @@ void core1_entry() {
     int sym_count = 0;
     const char *payloads[] = {"Hello", "World", "Rebeca"};
     int payload_idx = 0;
+    
+    uint32_t frame_counter = 0;
+    static const uint8_t payload_key[16] = { 0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6, 0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C };
+    static const uint8_t network_skey[16] = { 0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6, 0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C };
+    static const uint8_t devaddress[4] = { 0x26, 0x0B, 0x21, 0x25 };
 
     while (1) {
         for (int b = 0; b < 3; b++) {
             const char *current_payload = payloads[payload_idx];
-            uint8_t payload_buf[64]; memset(payload_buf, 0, sizeof(payload_buf));
-            memcpy(payload_buf, current_payload, strlen(current_payload));
-
-            CreateMessageFromPayload(symbols, &sym_count, 1024, LORA_SF, 4, payload_buf, strlen(current_payload));
+            uint8_t inner_payload_raw[64]; memset(inner_payload_raw, 0, sizeof(inner_payload_raw));
+            memcpy(inner_payload_raw, current_payload, strlen(current_payload));
             
-            printf("TX [%s] SF%d...", current_payload, LORA_SF); fflush(stdout);
+            uint8_t raw_payload_with_b0[256 + 16] = { 0 };
+            uint8_t * raw_payload = raw_payload_with_b0 + 16;
+            
+            int raw_payload_size = GenerateLoRaWANPacket(raw_payload_with_b0, inner_payload_raw, strlen(current_payload), payload_key, network_skey, devaddress, frame_counter);
+
+            CreateMessageFromPayload(symbols, &sym_count, 1024, LORA_SF, 4, raw_payload, raw_payload_size);
+            
+            printf("TX [%s] FCnt:%d...", current_payload, frame_counter); fflush(stdout);
             
             num_blocks = 0;
             for (int i = 0; i < 12; i++) queue_symbol(up_chirp_ram, 0, CHIRP_SIZE);
-            queue_symbol(up_chirp_ram, 8, CHIRP_SIZE);
-            queue_symbol(up_chirp_ram, 16, CHIRP_SIZE);
+            
+            uint8_t syncword = 0x21; // Private Sync Word for RF mapping compatibility
+            queue_symbol(up_chirp_ram, (syncword & 0x0f) * 8, CHIRP_SIZE);
+            queue_symbol(up_chirp_ram, ((syncword & 0xf0) >> 4) * 8, CHIRP_SIZE);
+            
             queue_symbol(down_chirp_ram, 0, CHIRP_SIZE);
             queue_symbol(down_chirp_ram, 0, CHIRP_SIZE);
             queue_symbol(down_chirp_ram, 0, CHIRP_SIZE / 4);
@@ -173,7 +186,9 @@ void core1_entry() {
             printf(" OK\n");
             
             payload_idx = (payload_idx + 1) % 3;
-            sleep_ms(1000);
+            sleep_ms(1500);
+            
+            frame_counter++; // Increase counter so we don't send duplicates
         }
         printf("Maintenance Window...\n");
         watchdog_update();

@@ -1,0 +1,6 @@
+/ {
+	wifi: wifi {
+		compatible = "espressif,esp32-wifi";
+		status = "okay";
+	};
+};
