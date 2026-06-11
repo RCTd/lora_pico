@@ -8,6 +8,8 @@
 #include "hardware/clocks.h"
 #include "hardware/watchdog.h"
 #include "hardware/irq.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
 #include "blink.pio.h"
 
 #include "pico/binary_info.h"
@@ -40,6 +42,11 @@ struct dma_block packet_blocks[2048];
 volatile int num_blocks = 0;
 volatile int next_block_to_queue = 0;
 volatile bool packet_done = false;
+
+// Flash Configuration
+#define FLASH_TARGET_OFFSET (1536 * 1024) 
+#define FLASH_MAGIC 0xDEADC0DE
+const uint32_t *flash_target_contents = (const uint32_t *) (XIP_BASE + FLASH_TARGET_OFFSET);
 
 void queue_symbol(const uint8_t *chirp_buf, uint16_t symbol_shift, uint32_t total_len_bytes) {
     uint32_t byte_offset = (uint32_t)(symbol_shift * BYTE_OFFSET_PER_SYMBOL);
@@ -88,7 +95,8 @@ void dma_handler() {
     }
 }
 
-void core1_entry() {
+void __not_in_flash_func(core1_entry)() {
+    multicore_lockout_victim_init();
     sleep_ms(3000);
     printf("Core 1: 25MHz RAM-Backed Engine Started (LoRaWAN)\n");
 
@@ -132,9 +140,17 @@ void core1_entry() {
     int payload_idx = 0;
     
     uint32_t frame_counter = 0;
+    // Try to load FCnt from Flash
+    if (flash_target_contents[0] == FLASH_MAGIC) {
+        frame_counter = flash_target_contents[1];
+    }
+    
+    // FORCED WIPE: Reset to 0 to align with TTN MAC state reset
+    frame_counter = 0;
+    
     static const uint8_t payload_key[16] = { 0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6, 0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C };
     static const uint8_t network_skey[16] = { 0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6, 0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C };
-    static const uint8_t devaddress[4] = { 0x26, 0x0B, 0x21, 0x25 };
+    static const uint8_t devaddress[4] = { 0x25, 0x21, 0x0B, 0x26 }; // Little Endian format
 
     while (1) {
         for (int b = 0; b < 3; b++) {
@@ -147,7 +163,7 @@ void core1_entry() {
             
             int raw_payload_size = GenerateLoRaWANPacket(raw_payload_with_b0, inner_payload_raw, strlen(current_payload), payload_key, network_skey, devaddress, frame_counter);
 
-            CreateMessageFromPayload(symbols, &sym_count, 1024, LORA_SF, 4, raw_payload, raw_payload_size);
+            CreateMessageFromPayload(symbols, &sym_count, 1024, LORA_SF, 1, raw_payload, raw_payload_size);
             
             printf("TX [%s] FCnt:%d...", current_payload, frame_counter); fflush(stdout);
             
@@ -188,8 +204,12 @@ void core1_entry() {
             payload_idx = (payload_idx + 1) % 3;
             sleep_ms(1500);
             
-            frame_counter++; // Increase counter so we don't send duplicates
+            frame_counter++; 
         }
+        
+        printf(" (Requesting FC Save to Flash)\n");
+        multicore_fifo_push_blocking(frame_counter);
+        
         printf("Maintenance Window...\n");
         watchdog_update();
         sleep_ms(5000);
@@ -203,5 +223,25 @@ int main() {
     watchdog_enable(8000, 1);
     printf("Pico W: No-Touch 125MHz Starting...\n");
     multicore_launch_core1(core1_entry);
-    while (1) tight_loop_contents();
+    
+    while (1) {
+        if (multicore_fifo_rvalid()) {
+            uint32_t fc = multicore_fifo_pop_blocking();
+            uint32_t flash_data[FLASH_PAGE_SIZE/sizeof(uint32_t)];
+            memset(flash_data, 0, FLASH_PAGE_SIZE);
+            flash_data[0] = FLASH_MAGIC;
+            flash_data[1] = fc;
+
+            multicore_lockout_start_blocking();
+            uint32_t ints = save_and_disable_interrupts();
+            flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);
+            flash_range_program(FLASH_TARGET_OFFSET, (const uint8_t *)flash_data, FLASH_PAGE_SIZE);
+            restore_interrupts(ints);
+            multicore_lockout_end_blocking();
+
+            printf("[Core 0] Frame Counter %lu saved to Flash.\n", fc);
+        }
+        tight_loop_contents();
+        watchdog_update();
+    }
 }

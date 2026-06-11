@@ -49,7 +49,7 @@ static struct lora_modem_config cfg_rx = {
         .bandwidth      = BW_125_KHZ,  
         .datarate       = SF_10,  
         .preamble_len   = 12,  
-        .coding_rate    = CR_4_8,  
+        .coding_rate    = CR_4_5,  
         .iq_inverted    = false,  
         .public_network = false,  
         .tx             = false,  
@@ -134,31 +134,7 @@ void debug_print_payload(uint8_t *data, uint16_t len) {
     printk("  Decrypted Text: [%s]\n", plain);
 }
 
-/* ---------- Base64 Encode (pentru TTN) ---------- */
-static const char base64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-static void base64_encode(const uint8_t *src, size_t len, char *dst) {
-	while (len > 0) {
-		*dst++ = base64_table[src[0] >> 2];
-		if (len > 1) {
-			*dst++ = base64_table[((src[0] & 0x03) << 4) | (src[1] >> 4)];
-			if (len > 2) {
-				*dst++ = base64_table[((src[1] & 0x0f) << 2) | (src[2] >> 6)];
-				*dst++ = base64_table[src[2] & 0x3f];
-				len -= 3; src += 3;
-			} else {
-				*dst++ = base64_table[(src[1] & 0x0f) << 2];
-				*dst++ = '=';
-				len = 0;
-			}
-		} else {
-			*dst++ = base64_table[(src[0] & 0x03) << 4];
-			*dst++ = '=';
-			*dst++ = '=';
-			len = 0;
-		}
-	}
-	*dst = '\0';
-}
+#include <zephyr/sys/base64.h>
 
 /* ---------- Wi-Fi Management ---------- */
 static struct net_mgmt_event_callback wifi_cb;
@@ -270,20 +246,29 @@ void lora_fwd_thread(void *p1, void *p2, void *p3) {
 			last_pull = now;
 		}
 
-		// B: PUSH_DATA (Masquerade 868.1/4/5)
+		// B: PUSH_DATA (Masquerading 864.92 -> 868.1 and 4/8 -> 4/5)
 		if (k_msgq_get(&fwd_q, &pkt, K_MSEC(500)) == 0) {
 			k_mutex_lock(&lora_lock, K_FOREVER);
 			lora_recv_async(lora_dev, NULL);
-			char b64[400]; base64_encode(pkt.data, pkt.len, b64);
+			char b64[400]; 
+			size_t olen;
+			base64_encode((uint8_t *)b64, sizeof(b64), &olen, pkt.data, pkt.len);
+			b64[olen] = '\0';
+			
 			char json[800];
-			snprintk(json, sizeof(json), "{\"rxpk\":[{\"tmst\":%u,\"freq\":868.1,\"chan\":0,\"rfch\":0,\"stat\":1,\"modu\":\"LORA\",\"datr\":\"SF10BW125\",\"codr\":\"4/5\",\"rssi\":%d,\"lsnr\":%.1f,\"size\":%u,\"data\":\"%s\"}]}",
-				k_uptime_get_32(), pkt.rssi, (double)pkt.snr, pkt.len, b64);
+			uint32_t tmst_us = k_uptime_get_32() * 1000; // Semtech UDP requires microseconds
+			
+			// Float is not supported by default in Zephyr snprintk. Using %d for SNR.
+			snprintk(json, sizeof(json), "{\"rxpk\":[{\"tmst\":%u,\"freq\":868.1,\"chan\":0,\"rfch\":0,\"stat\":1,\"modu\":\"LORA\",\"datr\":\"SF10BW125\",\"codr\":\"4/5\",\"rssi\":%d,\"lsnr\":%d.0,\"size\":%u,\"data\":\"%s\"}]}",
+				tmst_us, pkt.rssi, (int)pkt.snr, pkt.len, b64);
+			
 			buffer[0] = 0x02; sys_put_be16(k_cycle_get_32() & 0xFFFF, &buffer[1]);
 			buffer[3] = 0x00; memcpy(&buffer[4], g_gw_eui, 8);
 			int json_len = strlen(json); memcpy(&buffer[12], json, json_len);
 			zsock_sendto(sock, buffer, 12 + json_len, 0, res->ai_addr, res->ai_addrlen);
 			
-			LOG_INF("TDM: WIFI Uplink...");
+			LOG_INF("TDM: WIFI Uplink. JSON: %s", json);
+			
 			k_mutex_lock(&stats_mutex, K_NO_WAIT); g_stats.fwd_cnt++; k_mutex_unlock(&stats_mutex);
 			k_sleep(K_MSEC(150)); k_mutex_unlock(&lora_lock); k_wakeup(&thread_rx); 
 		}
