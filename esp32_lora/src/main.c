@@ -15,6 +15,9 @@
 #include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/sys/base64.h>
+#include <zephyr/fs/nvs.h>
+#include <zephyr/storage/flash_map.h>
+#include <zephyr/drivers/flash.h>
 #include <mbedtls/aes.h>
 #include <fcntl.h>
 
@@ -36,16 +39,16 @@ static const uint8_t app_skey[16] = { 0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 
 #define PRIORITY_MON 2  
 #define PRIORITY_DISP 6
   
-#define BTN_NODE      DT_ALIAS(sw0)  
 #define DISPLAY_NODE  DT_CHOSEN(zephyr_display)  
 #define LORA_NODE     DT_ALIAS(lora0)  
 
 /* ---------- Structuri de Date ---------- */  
-struct lora_packet_t {
-	uint8_t data[256];
+struct __attribute__((packed)) lora_packet_t {
+	uint32_t timestamp; 
 	uint16_t len;
 	int16_t rssi;
 	int8_t snr;
+	uint8_t data[256];
 };
 
 static struct lora_modem_config cfg_rx = {  
@@ -74,8 +77,17 @@ struct stats_t {
 	uint32_t fwd_cnt;
 	uint32_t pull_cnt;
 	uint32_t ack_cnt;
+	uint32_t backlog_cnt;
 };  
 static struct stats_t g_stats;  
+
+/* ---------- NVS Configuration ---------- */
+static struct nvs_fs fs;
+#define STORAGE_NODE DT_NODE_BY_FIXED_PARTITION_LABEL(storage)
+#define NVS_PACKET_ID_START 100
+#define NVS_MAX_PACKETS     100
+static uint16_t nvs_write_idx = 0;
+static uint16_t nvs_read_idx = 0;
 
 /* ---------- Forward Decls ---------- */
 static void lora_rx_cb(const struct device *dev, uint8_t *data, uint16_t len, int16_t rssi, int8_t snr);
@@ -178,7 +190,9 @@ static void lora_rx_cb(const struct device *dev, uint8_t *data, uint16_t len, in
 	LOG_INF("LoRa RX: %u bytes, RSSI: %d dBm", len, rssi);
     debug_print_payload(data, len);
 	struct lora_packet_t pkt;
+	memset(&pkt, 0, sizeof(pkt));
 	pkt.len = len; pkt.rssi = rssi; pkt.snr = snr;
+	pkt.timestamp = k_uptime_get_32() * 1000;
 	memcpy(pkt.data, data, len);
 	k_msgq_put(&fwd_q, &pkt, K_NO_WAIT);
 	k_mutex_lock(&stats_mutex, K_NO_WAIT); g_stats.rx_cnt++; k_mutex_unlock(&stats_mutex);  
@@ -200,50 +214,78 @@ void lora_fwd_thread(void *p1, void *p2, void *p3) {
 	struct lora_packet_t pkt;
 	uint8_t buffer[1024];
 	uint32_t last_pull = 0;
+	bool ttn_online = false;
 
 	for (;;) {
 		uint32_t now = k_uptime_get_32();
+		
 		if (last_pull == 0 || now - last_pull > 10000) {
 			k_mutex_lock(&lora_lock, K_FOREVER);
 			lora_recv_async(lora_dev, NULL);
 			buffer[0] = 0x02; sys_put_be16(k_cycle_get_32() & 0xFFFF, &buffer[1]);
 			buffer[3] = 0x02; memcpy(&buffer[4], g_gw_eui, 8);
 			zsock_sendto(sock, buffer, 12, 0, res->ai_addr, res->ai_addrlen);
-			
 			uint8_t ack[12];
 			struct zsock_pollfd fds = { .fd = sock, .events = ZSOCK_POLLIN };
 			if (zsock_poll(&fds, 1, 1000) > 0) {
 				if (zsock_recv(sock, ack, 12, 0) > 0) {
-					LOG_INF("TTN Server: Connected! (PULL_ACK)");
+					ttn_online = true;
 					k_mutex_lock(&stats_mutex, K_NO_WAIT); g_stats.ack_cnt++; k_mutex_unlock(&stats_mutex);
 				}
-			}
+			} else { ttn_online = false; }
 			k_mutex_lock(&stats_mutex, K_NO_WAIT); g_stats.pull_cnt++; k_mutex_unlock(&stats_mutex);
 			k_sleep(K_MSEC(50)); k_mutex_unlock(&lora_lock); k_wakeup(&thread_rx); 
 			last_pull = now;
 		}
 
+		if (ttn_online && g_stats.backlog_cnt > 0) {
+			struct lora_packet_t bl_pkt;
+			if (nvs_read(&fs, NVS_PACKET_ID_START + nvs_read_idx, &bl_pkt, sizeof(bl_pkt)) > 0) {
+				k_mutex_lock(&lora_lock, K_FOREVER);
+				lora_recv_async(lora_dev, NULL);
+				char b64[400]; size_t olen;
+				base64_encode((uint8_t *)b64, sizeof(b64), &olen, bl_pkt.data, bl_pkt.len); b64[olen] = '\0';
+				char json[800];
+				snprintk(json, sizeof(json), "{\"rxpk\":[{\"tmst\":%u,\"freq\":868.1,\"chan\":0,\"rfch\":0,\"stat\":1,\"modu\":\"LORA\",\"datr\":\"SF10BW125\",\"codr\":\"4/5\",\"rssi\":%d,\"lsnr\":%d.0,\"size\":%u,\"data\":\"%s\"}]}",
+					bl_pkt.timestamp, bl_pkt.rssi, (int)bl_pkt.snr, bl_pkt.len, b64);
+				buffer[0] = 0x02; sys_put_be16(k_cycle_get_32() & 0xFFFF, &buffer[1]);
+				buffer[3] = 0x00; memcpy(&buffer[4], g_gw_eui, 8);
+				int json_len = strlen(json); memcpy(&buffer[12], json, json_len);
+				zsock_sendto(sock, buffer, 12 + json_len, 0, res->ai_addr, res->ai_addrlen);
+				LOG_INF("JSON Backlog: %s", json);
+				nvs_delete(&fs, NVS_PACKET_ID_START + nvs_read_idx);
+				nvs_read_idx = (nvs_read_idx + 1) % NVS_MAX_PACKETS;
+				k_mutex_lock(&stats_mutex, K_NO_WAIT); g_stats.backlog_cnt--; k_mutex_unlock(&stats_mutex);
+				k_sleep(K_MSEC(150)); k_mutex_unlock(&lora_lock); k_wakeup(&thread_rx); 
+			}
+		}
+
 		if (k_msgq_get(&fwd_q, &pkt, K_MSEC(500)) == 0) {
-			k_mutex_lock(&lora_lock, K_FOREVER);
-			lora_recv_async(lora_dev, NULL);
-			char b64[400]; size_t olen;
-			base64_encode((uint8_t *)b64, sizeof(b64), &olen, pkt.data, pkt.len);
-			b64[olen] = '\0';
-			char json[800];
-			snprintk(json, sizeof(json), "{\"rxpk\":[{\"tmst\":%u,\"freq\":868.1,\"chan\":0,\"rfch\":0,\"stat\":1,\"modu\":\"LORA\",\"datr\":\"SF10BW125\",\"codr\":\"4/5\",\"rssi\":%d,\"lsnr\":%d.0,\"size\":%u,\"data\":\"%s\"}]}",
-				k_uptime_get_32() * 1000, pkt.rssi, (int)pkt.snr, pkt.len, b64);
-			buffer[0] = 0x02; sys_put_be16(k_cycle_get_32() & 0xFFFF, &buffer[1]);
-			buffer[3] = 0x00; memcpy(&buffer[4], g_gw_eui, 8);
-			int json_len = strlen(json); memcpy(&buffer[12], json, json_len);
-			zsock_sendto(sock, buffer, 12 + json_len, 0, res->ai_addr, res->ai_addrlen);
-			LOG_INF("TDM: WIFI Uplink...");
-			k_mutex_lock(&stats_mutex, K_NO_WAIT); g_stats.fwd_cnt++; k_mutex_unlock(&stats_mutex);
-			k_sleep(K_MSEC(150)); k_mutex_unlock(&lora_lock); k_wakeup(&thread_rx); 
+			if (ttn_online) {
+				k_mutex_lock(&lora_lock, K_FOREVER);
+				lora_recv_async(lora_dev, NULL);
+				char b64[400]; size_t olen;
+				base64_encode((uint8_t *)b64, sizeof(b64), &olen, pkt.data, pkt.len); b64[olen] = '\0';
+				char json[800];
+				snprintk(json, sizeof(json), "{\"rxpk\":[{\"tmst\":%u,\"freq\":868.1,\"chan\":0,\"rfch\":0,\"stat\":1,\"modu\":\"LORA\",\"datr\":\"SF10BW125\",\"codr\":\"4/5\",\"rssi\":%d,\"lsnr\":%d.0,\"size\":%u,\"data\":\"%s\"}]}",
+					pkt.timestamp, pkt.rssi, (int)pkt.snr, pkt.len, b64);
+				buffer[0] = 0x02; sys_put_be16(k_cycle_get_32() & 0xFFFF, &buffer[1]);
+				buffer[3] = 0x00; memcpy(&buffer[4], g_gw_eui, 8);
+				int json_len = strlen(json); memcpy(&buffer[12], json, json_len);
+				zsock_sendto(sock, buffer, 12 + json_len, 0, res->ai_addr, res->ai_addrlen);
+				LOG_INF("JSON RT: %s", json);
+				k_mutex_lock(&stats_mutex, K_NO_WAIT); g_stats.fwd_cnt++; k_mutex_unlock(&stats_mutex);
+				k_sleep(K_MSEC(150)); k_mutex_unlock(&lora_lock); k_wakeup(&thread_rx); 
+			} else {
+				nvs_write(&fs, NVS_PACKET_ID_START + nvs_write_idx, &pkt, sizeof(pkt));
+				nvs_write_idx = (nvs_write_idx + 1) % NVS_MAX_PACKETS;
+				k_mutex_lock(&stats_mutex, K_NO_WAIT); g_stats.backlog_cnt++; k_mutex_unlock(&stats_mutex);
+			}
 		}
 	}
 }
 
-/* ---------- TASK 3: Display Thread (Slow Refresh) ---------- */
+/* ---------- TASK 3: Display Thread ---------- */
 void display_thread(void *p1, void *p2, void *p3)  
 {  
 	display_dev = DEVICE_DT_GET(DISPLAY_NODE);  
@@ -253,13 +295,13 @@ void display_thread(void *p1, void *p2, void *p3)
     }
 	char buf[32];  
 	for (;;) {  
-		k_sleep(K_SECONDS(5));  // Refresh every 5s to save resources
+		k_sleep(K_SECONDS(5));  
 		if (device_is_ready(display_dev)) {
             k_mutex_lock(&stats_mutex, K_FOREVER);  
             cfb_framebuffer_clear(display_dev, false);  
             snprintk(buf, sizeof(buf), "RX:%u FWD:%u", g_stats.rx_cnt, g_stats.fwd_cnt);  
             cfb_print(display_dev, buf, 0, 0);  
-            snprintk(buf, sizeof(buf), "PULL:%u ACK:%u", g_stats.pull_cnt, g_stats.ack_cnt);  
+            snprintk(buf, sizeof(buf), "ACK:%u BKLOG:%u", g_stats.ack_cnt, g_stats.backlog_cnt);  
             cfb_print(display_dev, buf, 0, 16);  
             cfb_framebuffer_finalize(display_dev);  
             k_mutex_unlock(&stats_mutex);  
@@ -271,7 +313,7 @@ void monitor_thread(void *p1, void *p2, void *p3)
 {  
     for (;;) {  
         k_sleep(K_SECONDS(20));    
-		LOG_INF("Stats: RX:%u, FWD:%u, PULL:%u, ACK:%u", g_stats.rx_cnt, g_stats.fwd_cnt, g_stats.pull_cnt, g_stats.ack_cnt);
+		LOG_INF("Stats: RX:%u, FWD:%u, ACK:%u, BACKLOG:%u", g_stats.rx_cnt, g_stats.fwd_cnt, g_stats.ack_cnt, g_stats.backlog_cnt);
         k_wakeup(&thread_rx);
     }  
 }  
@@ -281,12 +323,21 @@ int main(void)
 {  
     lora_dev = DEVICE_DT_GET(LORA_NODE);  
     if (!device_is_ready(lora_dev)) return 0;  
+
+	struct flash_pages_info info;
+	fs.flash_device = DEVICE_DT_GET(DT_MTD_FROM_FIXED_PARTITION(STORAGE_NODE));
+	fs.offset = DT_REG_ADDR(STORAGE_NODE);
+	flash_get_page_info_by_offs(fs.flash_device, fs.offset, &info);
+	fs.sector_size = info.size;
+	fs.sector_count = 3; 
+	nvs_mount(&fs);
+
 	struct net_if *iface = net_if_get_default();
 	if (iface) {
 		uint8_t mac[6]; memcpy(mac, net_if_get_link_addr(iface)->addr, 6);
 		g_gw_eui[0]=mac[0]; g_gw_eui[1]=mac[1]; g_gw_eui[2]=mac[2]; g_gw_eui[3]=0xFF; g_gw_eui[4]=0xFE; g_gw_eui[5]=mac[3]; g_gw_eui[6]=mac[4]; g_gw_eui[7]=mac[5];
 	}
-	LOG_INF("LoRa TDM Gateway Initialized (Slow Display)");  
+	LOG_INF("LoRa Store-and-Forward Gateway Ready");  
 	k_thread_create(&thread_rx, stack_rx, STACK_SIZE, lora_rx_thread, NULL, NULL, NULL, PRIORITY_RX, 0, K_NO_WAIT);
 	k_thread_create(&thread_fwd, stack_fwd, 4096, lora_fwd_thread, NULL, NULL, NULL, PRIORITY_FWD, 0, K_NO_WAIT);
 	k_thread_create(&thread_mon, stack_mon, STACK_SIZE, monitor_thread, NULL, NULL, NULL, PRIORITY_MON, 0, K_NO_WAIT);
