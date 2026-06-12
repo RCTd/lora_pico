@@ -163,7 +163,7 @@ void __not_in_flash_func(core1_entry)() {
             
             int raw_payload_size = GenerateLoRaWANPacket(raw_payload_with_b0, inner_payload_raw, strlen(current_payload), payload_key, network_skey, devaddress, frame_counter);
 
-            CreateMessageFromPayload(symbols, &sym_count, 1024, LORA_SF, 1, raw_payload, raw_payload_size);
+            CreateMessageFromPayload(symbols, &sym_count, 1024, LORA_SF, 4, raw_payload, raw_payload_size);
             
             printf("TX [%s] FCnt:%d...", current_payload, frame_counter); fflush(stdout);
             

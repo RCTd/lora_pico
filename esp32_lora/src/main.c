@@ -56,7 +56,7 @@ static struct lora_modem_config cfg_rx = {
         .bandwidth      = BW_125_KHZ,  
         .datarate       = SF_10,  
         .preamble_len   = 12,  
-        .coding_rate    = CR_4_5,  
+        .coding_rate    = CR_4_8,  
         .iq_inverted    = false,  
         .public_network = false,  
         .tx             = false,  
@@ -134,6 +134,7 @@ void debug_print_payload(uint8_t *data, uint16_t len) {
     }
     mbedtls_aes_free(&aes);
     for (int i = 0; i < payload_len; i++) if (plain[i] < 32 || plain[i] > 126) plain[i] = '.';
+    plain[payload_len] = '\0';
     printk("  Decrypted Text: [%s]\n", plain);
 }
 
