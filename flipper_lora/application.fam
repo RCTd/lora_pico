@@ -1,0 +1,9 @@
+App(
+    appid="flipper_lora",
+    name="LoRa Gapless TX",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="flipper_lora_main",
+    stack_size=2 * 1024,
+    fap_category="GPIO",
+    sources=["flipper_lora.c"],
+)
