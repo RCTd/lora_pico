@@ -24,8 +24,8 @@
 LOG_MODULE_REGISTER(IoTProj, LOG_LEVEL_INF);
 
 /* ---------- Config Networking ---------- */
-#define WIFI_SSID "DIGI-gU2b"
-#define WIFI_PSK  "bC9yCPkUbz"
+#define WIFI_SSID "Lora-Fi"
+#define WIFI_PSK  "lora-pico"
 #define TTN_SERVER "63.34.215.128" 
 #define TTN_PORT   "1700"
 
@@ -140,17 +140,19 @@ void debug_print_payload(uint8_t *data, uint16_t len) {
 
 /* ---------- Wi-Fi Management ---------- */
 static struct net_mgmt_event_callback wifi_cb;
+static struct net_mgmt_event_callback ipv4_cb;
+
+static void ipv4_handler(struct net_mgmt_event_callback *cb, uint32_t mgmt_event, struct net_if *iface) {
+	if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
+		LOG_INF("IPv4 Address Assigned via DHCP!");
+		k_sem_give(&wifi_connected_sem);
+	}
+}
+
 static void wifi_handler(struct net_mgmt_event_callback *cb, uint32_t mgmt_event, struct net_if *iface) {
 	if (mgmt_event == NET_EVENT_WIFI_CONNECT_RESULT) {
-		LOG_INF("Wi-Fi Connected! Configuring Static IP...");
-		struct in_addr addr, mask, gw;
-		net_addr_pton(AF_INET, "192.168.1.50", &addr);
-		net_addr_pton(AF_INET, "255.255.255.0", &mask);
-		net_addr_pton(AF_INET, "192.168.1.1", &gw);
-		net_if_ipv4_addr_add(iface, &addr, NET_ADDR_MANUAL, 0);
-		net_if_ipv4_set_netmask_by_addr(iface, &addr, &mask);
-		net_if_ipv4_set_gw(iface, &gw);
-		k_sem_give(&wifi_connected_sem);
+		LOG_INF("Wi-Fi Connected! Starting DHCP...");
+		net_dhcpv4_start(iface);
 	}
 }
 
@@ -165,6 +167,8 @@ void connect_wifi(void) {
 	wifi_params.security = WIFI_SECURITY_TYPE_PSK;
 	net_mgmt_init_event_callback(&wifi_cb, wifi_handler, NET_EVENT_WIFI_CONNECT_RESULT);
 	net_mgmt_add_event_callback(&wifi_cb);
+	net_mgmt_init_event_callback(&ipv4_cb, ipv4_handler, NET_EVENT_IPV4_ADDR_ADD);
+	net_mgmt_add_event_callback(&ipv4_cb);
 	net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &wifi_params, sizeof(wifi_params));
 }
 
@@ -202,15 +206,25 @@ static void lora_rx_cb(const struct device *dev, uint8_t *data, uint16_t len, in
 
 /* ---------- TASK 2: TDM Forwarder ---------- */
 void lora_fwd_thread(void *p1, void *p2, void *p3) {
-	struct zsock_addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM, .ai_protocol = IPPROTO_UDP };
-	struct zsock_addrinfo *res;
 	k_sem_take(&wifi_connected_sem, K_FOREVER);
-	if (zsock_getaddrinfo(TTN_SERVER, TTN_PORT, &hints, &res) != 0) return;
-	int sock = zsock_socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-	if (sock < 0) return;
+	
+	int sock = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	while (sock < 0) {
+		LOG_ERR("Socket not ready, retrying in 3s...");
+		k_sleep(K_SECONDS(3));
+		sock = zsock_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	}
+
 	struct sockaddr_in local_addr;
-	local_addr.sin_family = AF_INET; local_addr.sin_port = htons(1700); local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	local_addr.sin_family = AF_INET; 
+	local_addr.sin_port = htons(1700); 
+	local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	zsock_bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr));
+
+	struct sockaddr_in dest_addr;
+	dest_addr.sin_family = AF_INET;
+	dest_addr.sin_port = htons(1700);
+	zsock_inet_pton(AF_INET, TTN_SERVER, &dest_addr.sin_addr);
 
 	struct lora_packet_t pkt;
 	uint8_t buffer[1024];
@@ -225,7 +239,7 @@ void lora_fwd_thread(void *p1, void *p2, void *p3) {
 			lora_recv_async(lora_dev, NULL);
 			buffer[0] = 0x02; sys_put_be16(k_cycle_get_32() & 0xFFFF, &buffer[1]);
 			buffer[3] = 0x02; memcpy(&buffer[4], g_gw_eui, 8);
-			zsock_sendto(sock, buffer, 12, 0, res->ai_addr, res->ai_addrlen);
+			zsock_sendto(sock, buffer, 12, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 			uint8_t ack[12];
 			struct zsock_pollfd fds = { .fd = sock, .events = ZSOCK_POLLIN };
 			if (zsock_poll(&fds, 1, 1000) > 0) {
@@ -252,7 +266,7 @@ void lora_fwd_thread(void *p1, void *p2, void *p3) {
 				buffer[0] = 0x02; sys_put_be16(k_cycle_get_32() & 0xFFFF, &buffer[1]);
 				buffer[3] = 0x00; memcpy(&buffer[4], g_gw_eui, 8);
 				int json_len = strlen(json); memcpy(&buffer[12], json, json_len);
-				zsock_sendto(sock, buffer, 12 + json_len, 0, res->ai_addr, res->ai_addrlen);
+				zsock_sendto(sock, buffer, 12 + json_len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 				LOG_INF("JSON Backlog: %s", json);
 				nvs_delete(&fs, NVS_PACKET_ID_START + nvs_read_idx);
 				nvs_read_idx = (nvs_read_idx + 1) % NVS_MAX_PACKETS;
@@ -273,7 +287,7 @@ void lora_fwd_thread(void *p1, void *p2, void *p3) {
 				buffer[0] = 0x02; sys_put_be16(k_cycle_get_32() & 0xFFFF, &buffer[1]);
 				buffer[3] = 0x00; memcpy(&buffer[4], g_gw_eui, 8);
 				int json_len = strlen(json); memcpy(&buffer[12], json, json_len);
-				zsock_sendto(sock, buffer, 12 + json_len, 0, res->ai_addr, res->ai_addrlen);
+				zsock_sendto(sock, buffer, 12 + json_len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 				LOG_INF("JSON RT: %s", json);
 				k_mutex_lock(&stats_mutex, K_NO_WAIT); g_stats.fwd_cnt++; k_mutex_unlock(&stats_mutex);
 				k_sleep(K_MSEC(150)); k_mutex_unlock(&lora_lock); k_wakeup(&thread_rx); 
