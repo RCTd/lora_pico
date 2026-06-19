@@ -1,3 +1,9 @@
+cmake_minimum_required(VERSION 3.13)
+
+include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+project(lora_sdr_project C CXX ASM)
+pico_sdk_init()
+
 add_executable(lora_dma
         multicore.c
         )
@@ -19,4 +25,4 @@ pico_enable_stdio_uart(lora_dma 0)
 pico_add_extra_outputs(lora_dma)
 
 # add url via pico_set_program_url
-example_auto_set_url(lora_dma)
+# example_auto_set_url(lora_dma)
